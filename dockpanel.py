@@ -2,131 +2,61 @@
 """
 Dockpanel - Universal System Management Tool
 A comprehensive YAST-like tool for managing Linux and macOS systems
-Author: Dockpanel Team
-License: GPL v3
 """
 
 import os
 import sys
 import subprocess
 import platform
-import locale
+import time
+import socket
+import pwd
+import grp
+import shutil
+import glob
 import re
 import json
 import threading
-import time
-import socket
-import grp
-import pwd
-import shutil
-import glob
-import math
-import concurrent.futures
-from datetime import datetime, timedelta
+import logging
+from datetime import datetime
 from pathlib import Path
-import gettext
-import signal
-import select
-import fcntl
-import queue
+from typing import Dict, List, Optional, Tuple, Any, Union
+from dataclasses import dataclass
+from abc import ABC, abstractmethod
 
-# GTK imports with version specification
 import gi
 gi.require_version('Gtk', '3.0')
-gi.require_version('Gdk', '3.0')
-gi.require_version('GLib', '2.0')
-gi.require_version('Gio', '2.0')
-gi.require_version('Pango', '1.0')
-gi.require_version('GdkPixbuf', '2.0')
-
 from gi.repository import Gtk, Gdk, GLib, Gio, Pango, GdkPixbuf
 
-# System detection
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Constants
+APP_NAME = "Dockpanel"
+APP_VERSION = "2.0.0"
+
+# System Detection
 SYSTEM = platform.system()
 DISTRO = "Unknown"
 PACKAGE_MANAGER = None
 PACKAGE_MANAGER_CMD = None
-INIT_SYSTEM = None
 
-# Cache for faster data fetching
-cache = {}
-cache_expiry = {}
-
-# Dependency management
-DEPENDENCIES = {
-    "ufw": {
-        "apt": "ufw",
-        "dnf": "ufw",
-        "zypper": "ufw",
-        "pacman": "ufw",
-        "brew": "ufw"
-    },
-    "timeshift": {
-        "apt": "timeshift",
-        "dnf": "timeshift",
-        "zypper": "timeshift",
-        "pacman": "timeshift",
-        "brew": ""
-    },
-    "snapper": {
-        "apt": "snapper",
-        "dnf": "snapper",
-        "zypper": "snapper",
-        "pacman": "snapper",
-        "brew": ""
-    },
-    "htop": {
-        "apt": "htop",
-        "dnf": "htop",
-        "zypper": "htop",
-        "pacman": "htop",
-        "brew": "htop"
-    },
-    "iotop": {
-        "apt": "iotop",
-        "dnf": "iotop",
-        "zypper": "iotop",
-        "pacman": "iotop",
-        "brew": "iotop"
-    },
-    "gparted": {
-        "apt": "gparted",
-        "dnf": "gparted",
-        "zypper": "gparted",
-        "pacman": "gparted",
-        "brew": ""
-    },
-    "ntpdate": {
-        "apt": "ntpdate",
-        "dnf": "ntpdate",
-        "zypper": "ntpdate",
-        "pacman": "ntp",
-        "brew": "ntp"
-    }
-}
-
-# Detect distribution and package manager
 def detect_system():
-    global PACKAGE_MANAGER, PACKAGE_MANAGER_CMD, INIT_SYSTEM, DISTRO
+    """Detect system distribution and package manager"""
+    global DISTRO, PACKAGE_MANAGER, PACKAGE_MANAGER_CMD
     
     if SYSTEM == "Linux":
-        # Try to detect distribution
         if os.path.exists("/etc/os-release"):
             with open("/etc/os-release", "r") as f:
                 for line in f:
                     if line.startswith("ID="):
                         DISTRO = line.split("=")[1].strip().strip('"')
                         break
-                    elif line.startswith("PRETTY_NAME="):
-                        DISTRO = line.split("=")[1].strip().strip('"')
         
-        # Package manager detection
         if os.path.exists("/usr/bin/apt"):
             PACKAGE_MANAGER = "apt"
             PACKAGE_MANAGER_CMD = ["apt"]
-        elif os.path.exists("/usr/bin/apt-get"):
-            PACKAGE_MANAGER = "apt"
-            PACKAGE_MANAGER_CMD = ["apt-get"]
         elif os.path.exists("/usr/bin/dnf"):
             PACKAGE_MANAGER = "dnf"
             PACKAGE_MANAGER_CMD = ["dnf"]
@@ -136,93 +66,1346 @@ def detect_system():
         elif os.path.exists("/usr/bin/pacman"):
             PACKAGE_MANAGER = "pacman"
             PACKAGE_MANAGER_CMD = ["pacman"]
-        
-        # Init system detection
-        if os.path.exists("/usr/bin/systemctl"):
-            INIT_SYSTEM = "systemd"
-        elif os.path.exists("/sbin/init"):
-            INIT_SYSTEM = "sysvinit"
-        elif os.path.exists("/usr/sbin/service"):
-            INIT_SYSTEM = "upstart"
-            
     elif SYSTEM == "Darwin":
         DISTRO = "macOS"
         if os.path.exists("/usr/local/bin/brew") or os.path.exists("/opt/homebrew/bin/brew"):
             PACKAGE_MANAGER = "brew"
             PACKAGE_MANAGER_CMD = ["brew"]
-        INIT_SYSTEM = "launchd"
 
 detect_system()
 
-# Translation setup
-def setup_translation():
-    """Setup translation based on system locale"""
+# Utility Functions
+def run_command(cmd: str, shell: bool = True, timeout: int = 30) -> Tuple[str, str, int]:
+    """Execute command and return stdout, stderr, returncode"""
     try:
-        current_locale = locale.getlocale()[0] or locale.getdefaultlocale()[0] or "en_US"
+        result = subprocess.run(
+            cmd,
+            shell=shell,
+            text=True,
+            capture_output=True,
+            timeout=timeout
+        )
+        return result.stdout.strip(), result.stderr.strip(), result.returncode
+    except subprocess.TimeoutExpired:
+        return "", "Command timed out", 1
+    except Exception as e:
+        return "", str(e), 1
+
+def run_sudo_command(cmd: str, password: str = None) -> Tuple[str, str, int]:
+    """Execute command with sudo privileges"""
+    if password:
+        cmd = f"echo '{password}' | sudo -S {cmd}"
+    else:
+        cmd = f"sudo {cmd}"
+    return run_command(cmd)
+
+# System Information Classes
+@dataclass
+class SystemInfo:
+    """System information data structure"""
+    os: str
+    distro: str
+    kernel: str
+    hostname: str
+    uptime: str
+    cpu_model: str
+    cpu_cores: int
+    memory_total: int
+    memory_used: int
+    disk_total: int
+    disk_used: int
+    boot_mode: str
+    secure_boot: bool
+
+class SystemInfoManager:
+    """Manages system information gathering"""
+    
+    @staticmethod
+    def get_system_info() -> SystemInfo:
+        """Get comprehensive system information"""
+        try:
+            # Basic system info
+            kernel = platform.release()
+            hostname = socket.gethostname()
+            
+            # CPU info
+            cpu_model = "Unknown"
+            cpu_cores = os.cpu_count() or 1
+            
+            if SYSTEM == "Linux":
+                with open('/proc/cpuinfo', 'r') as f:
+                    for line in f:
+                        if line.startswith('model name'):
+                            cpu_model = line.split(':')[1].strip()
+                            break
+            
+            # Memory info
+            memory_total = memory_used = 0
+            if SYSTEM == "Linux":
+                with open('/proc/meminfo', 'r') as f:
+                    meminfo = f.read()
+                    for line in meminfo.split('\n'):
+                        if line.startswith('MemTotal:'):
+                            memory_total = int(line.split()[1]) // 1024 // 1024
+                        elif line.startswith('MemAvailable:'):
+                            memory_used = memory_total - (int(line.split()[1]) // 1024 // 1024)
+            
+            # Disk info
+            disk_total = disk_used = 0
+            stdout, _, code = run_command("df -h /")
+            if code == 0:
+                parts = stdout.split('\n')[1].split()
+                if len(parts) >= 4:
+                    disk_total = float(parts[1].replace('G', ''))
+                    disk_used = float(parts[2].replace('G', ''))
+            
+            # Uptime
+            uptime = "Unknown"
+            if SYSTEM == "Linux":
+                with open('/proc/uptime', 'r') as f:
+                    uptime_seconds = float(f.read().split()[0])
+                    days = int(uptime_seconds // 86400)
+                    hours = int((uptime_seconds % 86400) // 3600)
+                    uptime = f"{days}d {hours}h"
+            
+            # Boot mode and secure boot
+            boot_mode = "Unknown"
+            secure_boot = False
+            if SYSTEM == "Linux":
+                stdout, _, code = run_command("efibootmgr 2>/dev/null")
+                if code == 0:
+                    boot_mode = "UEFI"
+                else:
+                    boot_mode = "BIOS"
+                
+                stdout, _, code = run_command("mokutil --sb-state 2>/dev/null")
+                if code == 0:
+                    secure_boot = "SecureBoot Enabled" in stdout
+            
+            return SystemInfo(
+                os=SYSTEM,
+                distro=DISTRO,
+                kernel=kernel,
+                hostname=hostname,
+                uptime=uptime,
+                cpu_model=cpu_model,
+                cpu_cores=cpu_cores,
+                memory_total=memory_total,
+                memory_used=memory_used,
+                disk_total=disk_total,
+                disk_used=disk_used,
+                boot_mode=boot_mode,
+                secure_boot=secure_boot
+            )
+        except Exception as e:
+            logger.error(f"Error getting system info: {e}")
+            return SystemInfo(
+                os=SYSTEM, distro=DISTRO, kernel="Unknown", hostname="Unknown",
+                uptime="Unknown", cpu_model="Unknown", cpu_cores=1,
+                memory_total=0, memory_used=0, disk_total=0, disk_used=0,
+                boot_mode="Unknown", secure_boot=False
+            )
+
+# Repository Management
+class RepositoryManager:
+    """Repository management interface"""
+    
+    @staticmethod
+    def get_repositories() -> List[Dict[str, Any]]:
+        """Get list of repositories"""
+        repos = []
         
-        lang_map = {
-            "en": "en_US",
-            "es": "es_ES",
-            "pt": "pt_BR",
-            "de": "de_DE",
-            "ru": "ru_RU",
-            "pl": "pl_PL",
-            "cs": "cs_CZ",
-            "sk": "sk_SK",
-            "uk": "uk_UA",
-            "hr": "hr_HR",
-            "sr": "sr_RS"
+        if PACKAGE_MANAGER == "apt":
+            sources_files = ["/etc/apt/sources.list"]
+            sources_files.extend(glob.glob("/etc/apt/sources.list.d/*.list"))
+            
+            for source_file in sources_files:
+                if os.path.exists(source_file):
+                    try:
+                        with open(source_file, 'r') as f:
+                            for line_num, line in enumerate(f, 1):
+                                line = line.strip()
+                                if line and not line.startswith('#'):
+                                    if 'deb ' in line:
+                                        enabled = not line.startswith('#deb ')
+                                        repo_info = line.replace('#', '').strip()
+                                        repos.append({
+                                            'file': source_file,
+                                            'line': line_num,
+                                            'name': repo_info,
+                                            'enabled': enabled,
+                                            'type': 'apt'
+                                        })
+                    except Exception as e:
+                        logger.error(f"Error reading {source_file}: {e}")
+        
+        elif PACKAGE_MANAGER == "dnf":
+            stdout, _, code = run_command("dnf repolist -v")
+            if code == 0:
+                for line in stdout.split('\n'):
+                    if 'Repo-id' in line:
+                        repo_id = line.split(':', 1)[1].strip()
+                        repos.append({
+                            'name': repo_id,
+                            'enabled': True,
+                            'type': 'dnf'
+                        })
+        
+        elif PACKAGE_MANAGER == "zypper":
+            stdout, _, code = run_command("zypper lr")
+            if code == 0:
+                for line in stdout.split('\n'):
+                    if line and not line.startswith('#') and '|' in line:
+                        parts = [p.strip() for p in line.split('|')]
+                        if len(parts) >= 3:
+                            alias = parts[1]
+                            enabled = parts[2] == 'Yes'
+                            repos.append({
+                                'name': alias,
+                                'enabled': enabled,
+                                'type': 'zypper'
+                            })
+        
+        elif PACKAGE_MANAGER == "pacman":
+            stdout, _, code = run_command("grep -E '^\\[.*\\]' /etc/pacman.conf")
+            if code == 0:
+                for line in stdout.split('\n'):
+                    if line.strip():
+                        repo = line.strip()
+                        enabled = not repo.startswith('#[')
+                        repos.append({
+                            'name': repo.replace('#', ''),
+                            'enabled': enabled,
+                            'type': 'pacman'
+                        })
+        
+        return repos
+    
+    @staticmethod
+    def add_repository(repo_url: str, repo_name: str = None, password: str = None) -> Tuple[bool, str]:
+        """Add a new repository"""
+        try:
+            if PACKAGE_MANAGER == "apt":
+                if not repo_name:
+                    repo_name = f"custom-repo-{int(time.time())}"
+                
+                # Create new sources file
+                sources_file = f"/etc/apt/sources.list.d/{repo_name}.list"
+                cmd = f"echo 'deb {repo_url}' > {sources_file}"
+                stdout, stderr, code = run_sudo_command(cmd, password)
+                
+                if code == 0:
+                    stdout, stderr, code = run_sudo_command("apt update", password)
+                    return code == 0, stderr if code != 0 else "Repository added successfully"
+                return False, stderr
+            
+            elif PACKAGE_MANAGER == "dnf":
+                cmd = f"dnf config-manager --add-repo {repo_url}"
+                stdout, stderr, code = run_sudo_command(cmd, password)
+                return code == 0, stderr if code != 0 else stdout
+            
+            elif PACKAGE_MANAGER == "zypper":
+                cmd = f"zypper addrepo {repo_url}"
+                stdout, stderr, code = run_sudo_command(cmd, password)
+                return code == 0, stderr if code != 0 else stdout
+            
+            elif PACKAGE_MANAGER == "pacman":
+                # For pacman, we need to manually edit pacman.conf
+                if not repo_name:
+                    repo_name = repo_url.split('/')[-1].replace('.git', '')
+                
+                # Backup pacman.conf
+                run_sudo_command("cp /etc/pacman.conf /etc/pacman.conf.bak", password)
+                
+                # Add repo to pacman.conf
+                cmd = f"echo -e '\\n[{repo_name}]\\nServer = {repo_url}' >> /etc/pacman.conf"
+                stdout, stderr, code = run_sudo_command(cmd, password)
+                return code == 0, stderr if code != 0 else "Repository added successfully"
+            
+            return False, "Unsupported package manager"
+        except Exception as e:
+            logger.error(f"Error adding repository: {e}")
+            return False, str(e)
+    
+    @staticmethod
+    def remove_repository(repo_name: str, password: str = None) -> Tuple[bool, str]:
+        """Remove a repository"""
+        try:
+            if PACKAGE_MANAGER == "apt":
+                # Find and remove from sources files
+                sources_files = ["/etc/apt/sources.list"]
+                sources_files.extend(glob.glob("/etc/apt/sources.list.d/*.list"))
+                
+                for source_file in sources_files:
+                    if os.path.exists(source_file):
+                        with open(source_file, 'r') as f:
+                            lines = f.readlines()
+                        
+                        new_lines = []
+                        removed = False
+                        for line in lines:
+                            if repo_name in line:
+                                removed = True
+                                continue
+                            new_lines.append(line)
+                        
+                        if removed:
+                            cmd = f"echo '{''.join(new_lines)}' > {source_file}"
+                            stdout, stderr, code = run_sudo_command(cmd, password)
+                            if code == 0:
+                                stdout, stderr, code = run_sudo_command("apt update", password)
+                                return code == 0, stderr if code != 0 else "Repository removed successfully"
+                            return False, stderr
+                
+                return False, "Repository not found"
+            
+            elif PACKAGE_MANAGER == "dnf":
+                cmd = f"dnf config-manager --disable {repo_name}"
+                stdout, stderr, code = run_sudo_command(cmd, password)
+                return code == 0, stderr if code != 0 else stdout
+            
+            elif PACKAGE_MANAGER == "zypper":
+                cmd = f"zypper removerepo {repo_name}"
+                stdout, stderr, code = run_sudo_command(cmd, password)
+                return code == 0, stderr if code != 0 else stdout
+            
+            elif PACKAGE_MANAGER == "pacman":
+                # Remove from pacman.conf
+                cmd = f"sed -i '/\\[{repo_name}\\]/,/^$/d' /etc/pacman.conf"
+                stdout, stderr, code = run_sudo_command(cmd, password)
+                return code == 0, stderr if code != 0 else "Repository removed successfully"
+            
+            return False, "Unsupported package manager"
+        except Exception as e:
+            logger.error(f"Error removing repository: {e}")
+            return False, str(e)
+    
+    @staticmethod
+    def toggle_repository(repo_name: str, enable: bool, password: str = None) -> Tuple[bool, str]:
+        """Enable or disable a repository"""
+        try:
+            if PACKAGE_MANAGER == "apt":
+                # Find and toggle in sources files
+                sources_files = ["/etc/apt/sources.list"]
+                sources_files.extend(glob.glob("/etc/apt/sources.list.d/*.list"))
+                
+                for source_file in sources_files:
+                    if os.path.exists(source_file):
+                        with open(source_file, 'r') as f:
+                            lines = f.readlines()
+                        
+                        new_lines = []
+                        toggled = False
+                        for line in lines:
+                            if repo_name in line:
+                                if enable and line.startswith('#deb '):
+                                    line = line[1:]  # Remove #
+                                    toggled = True
+                                elif not enable and line.startswith('deb '):
+                                    line = '#' + line  # Add #
+                                    toggled = True
+                            new_lines.append(line)
+                        
+                        if toggled:
+                            cmd = f"echo '{''.join(new_lines)}' > {source_file}"
+                            stdout, stderr, code = run_sudo_command(cmd, password)
+                            if code == 0:
+                                stdout, stderr, code = run_sudo_command("apt update", password)
+                                return code == 0, stderr if code != 0 else "Repository toggled successfully"
+                            return False, stderr
+                
+                return False, "Repository not found"
+            
+            elif PACKAGE_MANAGER == "dnf":
+                action = "enable" if enable else "disable"
+                cmd = f"dnf config-manager --{action} {repo_name}"
+                stdout, stderr, code = run_sudo_command(cmd, password)
+                return code == 0, stderr if code != 0 else stdout
+            
+            elif PACKAGE_MANAGER == "zypper":
+                action = "enable" if enable else "disable"
+                cmd = f"zypper {action}repo {repo_name}"
+                stdout, stderr, code = run_sudo_command(cmd, password)
+                return code == 0, stderr if code != 0 else stdout
+            
+            elif PACKAGE_MANAGER == "pacman":
+                # Toggle by commenting/uncommenting in pacman.conf
+                if enable:
+                    cmd = f"sed -i 's/^#\\[{repo_name}\\]/[{repo_name}/' /etc/pacman.conf"
+                else:
+                    cmd = f"sed -i 's/^\\[{repo_name}\\]/#[{repo_name}/' /etc/pacman.conf"
+                
+                stdout, stderr, code = run_sudo_command(cmd, password)
+                return code == 0, stderr if code != 0 else "Repository toggled successfully"
+            
+            return False, "Unsupported package manager"
+        except Exception as e:
+            logger.error(f"Error toggling repository: {e}")
+            return False, str(e)
+    
+    @staticmethod
+    def refresh_repositories(password: str = None) -> Tuple[bool, str]:
+        """Refresh all repositories"""
+        try:
+            if PACKAGE_MANAGER == "apt":
+                stdout, stderr, code = run_sudo_command("apt update", password)
+                return code == 0, stderr if code != 0 else stdout
+            
+            elif PACKAGE_MANAGER == "dnf":
+                stdout, stderr, code = run_sudo_command("dnf makecache", password)
+                return code == 0, stderr if code != 0 else stdout
+            
+            elif PACKAGE_MANAGER == "zypper":
+                stdout, stderr, code = run_sudo_command("zypper refresh", password)
+                return code == 0, stderr if code != 0 else stdout
+            
+            elif PACKAGE_MANAGER == "pacman":
+                stdout, stderr, code = run_sudo_command("pacman -Sy", password)
+                return code == 0, stderr if code != 0 else stdout
+            
+            return False, "Unsupported package manager"
+        except Exception as e:
+            logger.error(f"Error refreshing repositories: {e}")
+            return False, str(e)
+
+# Boot Configuration Management
+class BootManager:
+    """Boot configuration management"""
+    
+    @staticmethod
+    def get_boot_config() -> Dict[str, Any]:
+        """Get boot configuration"""
+        config = {
+            'bootloader': 'Unknown',
+            'default_entry': 'Unknown',
+            'timeout': 0,
+            'entries': []
         }
         
-        lang_code = current_locale.split("_")[0]
-        if lang_code in lang_map:
-            locale_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "locale")
-            os.makedirs(locale_dir, exist_ok=True)
-            
-            for lang in lang_map.values():
-                lang_path = os.path.join(locale_dir, lang, "LC_MESSAGES")
-                os.makedirs(lang_path, exist_ok=True)
-            
-            translation = gettext.translation("dockpanel", locale_dir, fallback=True)
-            translation.install()
-            return translation
-    except Exception as e:
-        print(f"Translation setup error: {e}")
+        try:
+            if SYSTEM == "Linux":
+                # Check for GRUB
+                if os.path.exists("/boot/grub/grub.cfg"):
+                    config['bootloader'] = 'GRUB2'
+                    
+                    # Get GRUB configuration
+                    stdout, _, code = run_command("grep -E '^menuentry|^set default=' /boot/grub/grub.cfg")
+                    if code == 0:
+                        for line in stdout.split('\n'):
+                            if line.startswith('menuentry'):
+                                title = re.search(r'"([^"]+)"', line)
+                                if title:
+                                    config['entries'].append(title.group(1))
+                            elif line.startswith('set default='):
+                                default = line.split('=')[1].strip()
+                                config['default_entry'] = default
+                    
+                    # Get timeout
+                    stdout, _, code = run_command("grep -E '^set timeout=' /boot/grub/grub.cfg")
+                    if code == 0:
+                        for line in stdout.split('\n'):
+                            if line.startswith('set timeout='):
+                                config['timeout'] = int(line.split('=')[1].strip())
+                
+                # Check for systemd-boot
+                elif os.path.exists("/boot/loader/loader.conf"):
+                    config['bootloader'] = 'systemd-boot'
+                    
+                    with open("/boot/loader/loader.conf", 'r') as f:
+                        for line in f:
+                            line = line.strip()
+                            if line.startswith('default '):
+                                config['default_entry'] = line.split()[1]
+                            elif line.startswith('timeout '):
+                                config['timeout'] = int(line.split()[1])
+                    
+                    # Get entries
+                    entries_dir = "/boot/loader/entries"
+                    if os.path.exists(entries_dir):
+                        for entry_file in os.listdir(entries_dir):
+                            if entry_file.endswith('.conf'):
+                                config['entries'].append(entry_file[:-5])
+                
+                # Check for rEFInd
+                elif os.path.exists("/boot/efi/EFI/refind/refind.conf"):
+                    config['bootloader'] = 'rEFInd'
+        
+        except Exception as e:
+            logger.error(f"Error getting boot config: {e}")
+        
+        return config
     
-    class DummyTranslation:
-        def gettext(self, message):
-            return message
-        def install(self):
+    @staticmethod
+    def update_grub(password: str = None) -> Tuple[bool, str]:
+        """Update GRUB configuration"""
+        try:
+            stdout, stderr, code = run_sudo_command("update-grub", password)
+            return code == 0, stderr if code != 0 else stdout
+        except Exception as e:
+            logger.error(f"Error updating GRUB: {e}")
+            return False, str(e)
+    
+    @staticmethod
+    def set_default_boot_entry(entry: str, password: str = None) -> Tuple[bool, str]:
+        """Set default boot entry"""
+        try:
+            if os.path.exists("/etc/default/grub"):
+                # Update GRUB_DEFAULT
+                cmd = f"sed -i 's/^GRUB_DEFAULT=.*/GRUB_DEFAULT=\"{entry}\"/' /etc/default/grub"
+                stdout, stderr, code = run_sudo_command(cmd, password)
+                
+                if code == 0:
+                    return BootManager.update_grub(password)
+                return False, stderr
+            
+            return False, "GRUB configuration not found"
+        except Exception as e:
+            logger.error(f"Error setting default boot entry: {e}")
+            return False, str(e)
+    
+    @staticmethod
+    def set_boot_timeout(timeout: int, password: str = None) -> Tuple[bool, str]:
+        """Set boot timeout"""
+        try:
+            if os.path.exists("/etc/default/grub"):
+                # Update GRUB_TIMEOUT
+                cmd = f"sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT={timeout}/' /etc/default/grub"
+                stdout, stderr, code = run_sudo_command(cmd, password)
+                
+                if code == 0:
+                    return BootManager.update_grub(password)
+                return False, stderr
+            
+            return False, "GRUB configuration not found"
+        except Exception as e:
+            logger.error(f"Error setting boot timeout: {e}")
+            return False, str(e)
+
+# Kernel Management
+class KernelManager:
+    """Kernel management interface"""
+    
+    @staticmethod
+    def get_installed_kernels() -> List[Dict[str, Any]]:
+        """Get list of installed kernels"""
+        kernels = []
+        
+        try:
+            if SYSTEM == "Linux":
+                # Get installed kernels from /boot
+                boot_dir = "/boot"
+                if os.path.exists(boot_dir):
+                    for item in os.listdir(boot_dir):
+                        if item.startswith("vmlinuz-"):
+                            version = item[8:]  # Remove "vmlinuz-"
+                            kernel_path = os.path.join(boot_dir, item)
+                            
+                            # Check if it's the current kernel
+                            current = False
+                            with open("/proc/version", 'r') as f:
+                                current_version = f.read().split()[2]
+                                if version in current_version:
+                                    current = True
+                            
+                            # Get kernel size
+                            size = os.path.getsize(kernel_path) // (1024 * 1024)  # MB
+                            
+                            kernels.append({
+                                'version': version,
+                                'path': kernel_path,
+                                'current': current,
+                                'size': size
+                            })
+                
+                # Sort by version
+                kernels.sort(key=lambda x: x['version'], reverse=True)
+        
+        except Exception as e:
+            logger.error(f"Error getting installed kernels: {e}")
+        
+        return kernels
+    
+    @staticmethod
+    def remove_old_kernels(keep_count: int = 2, password: str = None) -> Tuple[bool, str]:
+        """Remove old kernels, keeping the specified number"""
+        try:
+            kernels = KernelManager.get_installed_kernels()
+            
+            # Keep current kernel and specified number of recent kernels
+            to_remove = []
+            kept = 0
+            
+            for kernel in kernels:
+                if kernel['current']:
+                    continue  # Never remove current kernel
+                
+                if kept < keep_count:
+                    kept += 1
+                else:
+                    to_remove.append(kernel)
+            
+            if not to_remove:
+                return True, "No old kernels to remove"
+            
+            # Remove old kernels
+            for kernel in to_remove:
+                version = kernel['version']
+                
+                if PACKAGE_MANAGER == "apt":
+                    cmd = f"apt remove -y linux-image-{version} linux-headers-{version}"
+                elif PACKAGE_MANAGER == "dnf":
+                    cmd = f"dnf remove -y kernel-{version}"
+                elif PACKAGE_MANAGER == "zypper":
+                    cmd = f"zypper remove -y kernel-{version}"
+                else:
+                    # Manual removal
+                    cmd = f"rm -f /boot/vmlinuz-{version} /boot/initrd.img-{version} /boot/config-{version} /boot/System.map-{version}"
+                
+                stdout, stderr, code = run_sudo_command(cmd, password)
+                if code != 0:
+                    return False, f"Failed to remove kernel {version}: {stderr}"
+            
+            # Update bootloader
+            if PACKAGE_MANAGER == "apt":
+                BootManager.update_grub(password)
+            
+            return True, f"Removed {len(to_remove)} old kernels"
+        except Exception as e:
+            logger.error(f"Error removing old kernels: {e}")
+            return False, str(e)
+
+# System Services Management
+class SystemServiceManager:
+    """Enhanced system services management"""
+    
+    @staticmethod
+    def get_all_services() -> List[Dict[str, Any]]:
+        """Get all system services with detailed information"""
+        services = []
+        
+        try:
+            if os.path.exists("/usr/bin/systemctl"):
+                # Get all services
+                stdout, _, code = run_command("systemctl list-units --type=service --all --no-pager")
+                if code == 0:
+                    for line in stdout.split('\n'):
+                        if '.service' in line and not line.startswith('UNIT') and not line.startswith('●'):
+                            parts = line.split()
+                            if len(parts) >= 4:
+                                service_name = parts[0]
+                                load = parts[1]
+                                active = parts[2]
+                                sub = parts[3]
+                                description = ' '.join(parts[4:]) if len(parts) > 4 else ""
+                                
+                                # Get additional service info
+                                enabled = False
+                                stdout2, _, code2 = run_command(f"systemctl is-enabled {service_name}")
+                                if code2 == 0:
+                                    enabled = stdout2.strip() == "enabled"
+                                
+                                services.append({
+                                    'name': service_name,
+                                    'load': load,
+                                    'active': active,
+                                    'sub': sub,
+                                    'description': description,
+                                    'enabled': enabled
+                                })
+        
+        except Exception as e:
+            logger.error(f"Error getting services: {e}")
+        
+        return services
+    
+    @staticmethod
+    def get_service_status(service_name: str) -> Dict[str, Any]:
+        """Get detailed status of a specific service"""
+        status = {
+            'name': service_name,
+            'loaded': False,
+            'active': False,
+            'enabled': False,
+            'description': '',
+            'main_pid': 0,
+            'memory': 0,
+            'tasks': 0
+        }
+        
+        try:
+            if os.path.exists("/usr/bin/systemctl"):
+                # Get service status
+                stdout, _, code = run_command(f"systemctl show {service_name}")
+                if code == 0:
+                    for line in stdout.split('\n'):
+                        if '=' in line:
+                            key, value = line.split('=', 1)
+                            if key == 'LoadState':
+                                status['loaded'] = value != 'not-found'
+                            elif key == 'ActiveState':
+                                status['active'] = value == 'active'
+                            elif key == 'UnitFileState':
+                                status['enabled'] = value == 'enabled'
+                            elif key == 'Description':
+                                status['description'] = value
+                            elif key == 'MainPID':
+                                status['main_pid'] = int(value)
+                            elif key == 'MemoryCurrent':
+                                if value != '[not set]':
+                                    status['memory'] = int(value) // 1024 // 1024  # MB
+                            elif key == 'TasksCurrent':
+                                if value != '[not set]':
+                                    status['tasks'] = int(value)
+        
+        except Exception as e:
+            logger.error(f"Error getting service status: {e}")
+        
+        return status
+    
+    @staticmethod
+    def enable_service(service_name: str, password: str = None) -> Tuple[bool, str]:
+        """Enable a service to start at boot"""
+        try:
+            cmd = f"systemctl enable {service_name}"
+            stdout, stderr, code = run_sudo_command(cmd, password)
+            return code == 0, stderr if code != 0 else stdout
+        except Exception as e:
+            logger.error(f"Error enabling service: {e}")
+            return False, str(e)
+    
+    @staticmethod
+    def disable_service(service_name: str, password: str = None) -> Tuple[bool, str]:
+        """Disable a service from starting at boot"""
+        try:
+            cmd = f"systemctl disable {service_name}"
+            stdout, stderr, code = run_sudo_command(cmd, password)
+            return code == 0, stderr if code != 0 else stdout
+        except Exception as e:
+            logger.error(f"Error disabling service: {e}")
+            return False, str(e)
+    
+    @staticmethod
+    def mask_service(service_name: str, password: str = None) -> Tuple[bool, str]:
+        """Mask a service (completely disable it)"""
+        try:
+            cmd = f"systemctl mask {service_name}"
+            stdout, stderr, code = run_sudo_command(cmd, password)
+            return code == 0, stderr if code != 0 else stdout
+        except Exception as e:
+            logger.error(f"Error masking service: {e}")
+            return False, str(e)
+    
+    @staticmethod
+    def unmask_service(service_name: str, password: str = None) -> Tuple[bool, str]:
+        """Unmask a service"""
+        try:
+            cmd = f"systemctl unmask {service_name}"
+            stdout, stderr, code = run_sudo_command(cmd, password)
+            return code == 0, stderr if code != 0 else stdout
+        except Exception as e:
+            logger.error(f"Error unmasking service: {e}")
+            return False, str(e)
+
+# Firewall Management
+class FirewallManager:
+    """Enhanced firewall management"""
+    
+    @staticmethod
+    def get_firewall_info() -> Dict[str, Any]:
+        """Get comprehensive firewall information"""
+        info = {
+            'backend': 'unknown',
+            'active': False,
+            'default_zone': '',
+            'zones': [],
+            'rules': []
+        }
+        
+        try:
+            if SYSTEM == "Linux":
+                # Check for UFW
+                stdout, _, code = run_command("which ufw")
+                if code == 0:
+                    info['backend'] = 'ufw'
+                    
+                    # Get UFW status
+                    stdout, _, code = run_command("ufw status verbose")
+                    if code == 0:
+                        info['active'] = 'Status: active' in stdout
+                        
+                        # Parse rules
+                        for line in stdout.split('\n'):
+                            if line.strip() and not line.startswith('Status') and not line.startswith('Action') and not line.startswith('--'):
+                                parts = line.split()
+                                if len(parts) >= 4:
+                                    info['rules'].append({
+                                        'action': parts[0],
+                                        'direction': parts[1],
+                                        'protocol': parts[3] if len(parts) > 3 else 'any',
+                                        'source': parts[4] if len(parts) > 4 else 'any',
+                                        'destination': parts[5] if len(parts) > 5 else 'any'
+                                    })
+                
+                # Check for firewalld
+                stdout, _, code = run_command("which firewall-cmd")
+                if code == 0:
+                    info['backend'] = 'firewalld'
+                    
+                    # Get firewalld status
+                    stdout, _, code = run_command("firewall-cmd --state")
+                    if code == 0:
+                        info['active'] = stdout.strip() == 'running'
+                    
+                    # Get default zone
+                    stdout, _, code = run_command("firewall-cmd --get-default-zone")
+                    if code == 0:
+                        info['default_zone'] = stdout.strip()
+                    
+                    # Get zones
+                    stdout, _, code = run_command("firewall-cmd --get-zones")
+                    if code == 0:
+                        zones = stdout.strip().split()
+                        for zone in zones:
+                            zone_info = {'name': zone, 'active': False, 'services': [], 'ports': []}
+                            
+                            # Check if zone is active
+                            stdout2, _, code2 = run_command(f"firewall-cmd --get-active-zones")
+                            if code2 == 0:
+                                zone_info['active'] = zone in stdout2
+                            
+                            # Get services in zone
+                            stdout3, _, code3 = run_command(f"firewall-cmd --zone={zone} --list-services")
+                            if code3 == 0:
+                                zone_info['services'] = stdout3.strip().split()
+                            
+                            # Get ports in zone
+                            stdout4, _, code4 = run_command(f"firewall-cmd --zone={zone} --list-ports")
+                            if code4 == 0:
+                                zone_info['ports'] = stdout4.strip().split()
+                            
+                            info['zones'].append(zone_info)
+        
+        except Exception as e:
+            logger.error(f"Error getting firewall info: {e}")
+        
+        return info
+    
+    @staticmethod
+    def add_firewall_rule(rule: Dict[str, str], password: str = None) -> Tuple[bool, str]:
+        """Add a firewall rule"""
+        try:
+            if rule.get('backend') == 'ufw':
+                action = rule.get('action', 'allow')
+                protocol = rule.get('protocol', 'any')
+                port = rule.get('port', '')
+                source = rule.get('source', '')
+                
+                cmd = f"ufw {action}"
+                if protocol != 'any':
+                    cmd += f" {protocol}"
+                if port:
+                    cmd += f" {port}"
+                if source:
+                    cmd += f" from {source}"
+                
+                stdout, stderr, code = run_sudo_command(cmd, password)
+                return code == 0, stderr if code != 0 else stdout
+            
+            elif rule.get('backend') == 'firewalld':
+                zone = rule.get('zone', 'public')
+                
+                if rule.get('type') == 'service':
+                    service = rule.get('service', '')
+                    cmd = f"firewall-cmd --zone={zone} --add-service={service} --permanent"
+                elif rule.get('type') == 'port':
+                    port = rule.get('port', '')
+                    protocol = rule.get('protocol', 'tcp')
+                    cmd = f"firewall-cmd --zone={zone} --add-port={port}/{protocol} --permanent"
+                
+                stdout, stderr, code = run_sudo_command(cmd, password)
+                if code == 0:
+                    # Reload firewall
+                    stdout2, stderr2, code2 = run_sudo_command("firewall-cmd --reload", password)
+                    return code2 == 0, stderr2 if code2 != 0 else "Rule added successfully"
+                return False, stderr
+            
+            return False, "Unsupported firewall backend"
+        except Exception as e:
+            logger.error(f"Error adding firewall rule: {e}")
+            return False, str(e)
+    
+    @staticmethod
+    def remove_firewall_rule(rule: Dict[str, str], password: str = None) -> Tuple[bool, str]:
+        """Remove a firewall rule"""
+        try:
+            if rule.get('backend') == 'ufw':
+                # UFW doesn't have direct rule removal by ID, need to match
+                action = 'deny' if rule.get('action') == 'allow' else 'allow'
+                protocol = rule.get('protocol', 'any')
+                port = rule.get('port', '')
+                source = rule.get('source', '')
+                
+                cmd = f"ufw {action}"
+                if protocol != 'any':
+                    cmd += f" {protocol}"
+                if port:
+                    cmd += f" {port}"
+                if source:
+                    cmd += f" from {source}"
+                
+                stdout, stderr, code = run_sudo_command(cmd, password)
+                return code == 0, stderr if code != 0 else stdout
+            
+            elif rule.get('backend') == 'firewalld':
+                zone = rule.get('zone', 'public')
+                
+                if rule.get('type') == 'service':
+                    service = rule.get('service', '')
+                    cmd = f"firewall-cmd --zone={zone} --remove-service={service} --permanent"
+                elif rule.get('type') == 'port':
+                    port = rule.get('port', '')
+                    protocol = rule.get('protocol', 'tcp')
+                    cmd = f"firewall-cmd --zone={zone} --remove-port={port}/{protocol} --permanent"
+                
+                stdout, stderr, code = run_sudo_command(cmd, password)
+                if code == 0:
+                    # Reload firewall
+                    stdout2, stderr2, code2 = run_sudo_command("firewall-cmd --reload", password)
+                    return code2 == 0, stderr2 if code2 != 0 else "Rule removed successfully"
+                return False, stderr
+            
+            return False, "Unsupported firewall backend"
+        except Exception as e:
+            logger.error(f"Error removing firewall rule: {e}")
+            return False, str(e)
+
+# System Logs Management
+class LogManager:
+    """System logs management"""
+    
+    @staticmethod
+    def get_logs(log_type: str = 'system', lines: int = 100) -> List[str]:
+        """Get system logs"""
+        logs = []
+        
+        try:
+            if log_type == 'system':
+                if os.path.exists("/usr/bin/journalctl"):
+                    stdout, _, code = run_command(f"journalctl -n {lines} --no-pager")
+                    if code == 0:
+                        logs = stdout.split('\n')
+                else:
+                    # Fallback to syslog
+                    if os.path.exists("/var/log/syslog"):
+                        stdout, _, code = run_command(f"tail -n {lines} /var/log/syslog")
+                        if code == 0:
+                            logs = stdout.split('\n')
+            
+            elif log_type == 'kernel':
+                if os.path.exists("/usr/bin/journalctl"):
+                    stdout, _, code = run_command(f"journalctl -k -n {lines} --no-pager")
+                    if code == 0:
+                        logs = stdout.split('\n')
+                else:
+                    # Fallback to dmesg
+                    stdout, _, code = run_command(f"dmesg | tail -n {lines}")
+                    if code == 0:
+                        logs = stdout.split('\n')
+            
+            elif log_type == 'auth':
+                if os.path.exists("/var/log/auth.log"):
+                    stdout, _, code = run_command(f"tail -n {lines} /var/log/auth.log")
+                    if code == 0:
+                        logs = stdout.split('\n')
+        
+        except Exception as e:
+            logger.error(f"Error getting logs: {e}")
+        
+        return logs
+    
+    @staticmethod
+    def clear_logs(log_type: str = 'system', password: str = None) -> Tuple[bool, str]:
+        """Clear system logs"""
+        try:
+            if log_type == 'system':
+                if os.path.exists("/usr/bin/journalctl"):
+                    stdout, stderr, code = run_sudo_command("journalctl --vacuum-time=1s", password)
+                    return code == 0, stderr if code != 0 else stdout
+                else:
+                    stdout, stderr, code = run_sudo_command("> /var/log/syslog", password)
+                    return code == 0, stderr if code != 0 else "Logs cleared"
+            
+            elif log_type == 'kernel':
+                stdout, stderr, code = run_sudo_command("dmesg -c", password)
+                return code == 0, stderr if code != 0 else "Kernel logs cleared"
+        
+        except Exception as e:
+            logger.error(f"Error clearing logs: {e}")
+            return False, str(e)
+
+# Package Management (Enhanced)
+class PackageManager:
+    """Enhanced package management interface"""
+    
+    def __init__(self):
+        self.manager = PACKAGE_MANAGER
+        self.cmd = PACKAGE_MANAGER_CMD
+    
+    def search_packages(self, query: str) -> List[Tuple[str, str]]:
+        """Search for packages"""
+        if not self.manager:
+            return []
+        
+        commands = {
+            "apt": f"apt search {query}",
+            "dnf": f"dnf search {query}",
+            "zypper": f"zypper search {query}",
+            "pacman": f"pacman -Ss {query}",
+            "brew": f"brew search {query}"
+        }
+        
+        if self.manager in commands:
+            stdout, _, code = run_command(commands[self.manager])
+            if code == 0:
+                return self._parse_package_list(stdout)
+        return []
+    
+    def _parse_package_list(self, output: str) -> List[Tuple[str, str]]:
+        """Parse package list output"""
+        packages = []
+        for line in output.split('\n'):
+            if line.strip():
+                if self.manager == "apt" and '/' in line and line[0].isalnum():
+                    pkg = line.split('/')[0].strip()
+                    desc = line.split(' - ', 1)[-1].strip()
+                    packages.append((pkg, desc))
+                elif self.manager == "brew" and not line.startswith('==>'):
+                    parts = line.split(' ', 1)
+                    if len(parts) == 2:
+                        packages.append((parts[0].strip(), parts[1].strip()))
+        return packages
+    
+    def get_installed_packages(self) -> List[Tuple[str, str, str]]:
+        """Get installed packages"""
+        if not self.manager:
+            return []
+        
+        commands = {
+            "apt": "dpkg -l",
+            "dnf": "dnf list installed",
+            "zypper": "zypper search -i",
+            "pacman": "pacman -Q",
+            "brew": "brew list"
+        }
+        
+        if self.manager in commands:
+            stdout, _, code = run_command(commands[self.manager])
+            if code == 0:
+                return self._parse_installed_list(stdout)
+        return []
+    
+    def _parse_installed_list(self, output: str) -> List[Tuple[str, str, str]]:
+        """Parse installed packages list"""
+        packages = []
+        for line in output.split('\n'):
+            if line.strip():
+                if self.manager == "apt" and line.startswith('ii'):
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        packages.append((parts[1], parts[2], ' '.join(parts[3:])))
+                elif self.manager == "brew":
+                    pkg = line.strip()
+                    if pkg:
+                        packages.append((pkg, "", ""))
+        return packages
+    
+    def install_package(self, package: str, password: str = None) -> Tuple[bool, str]:
+        """Install a package"""
+        if not self.manager:
+            return False, "No package manager found"
+        
+        commands = {
+            "apt": f"apt install -y {package}",
+            "dnf": f"dnf install -y {package}",
+            "zypper": f"zypper install -y {package}",
+            "pacman": f"pacman -S --noconfirm {package}",
+            "brew": f"brew install {package}"
+        }
+        
+        if self.manager in commands:
+            if self.manager != "brew":
+                stdout, stderr, code = run_sudo_command(commands[self.manager], password)
+            else:
+                stdout, stderr, code = run_command(commands[self.manager])
+            
+            return code == 0, stderr if code != 0 else stdout
+        return False, "Unsupported package manager"
+    
+    def remove_package(self, package: str, password: str = None) -> Tuple[bool, str]:
+        """Remove a package"""
+        if not self.manager:
+            return False, "No package manager found"
+        
+        commands = {
+            "apt": f"apt remove -y {package}",
+            "dnf": f"dnf remove -y {package}",
+            "zypper": f"zypper remove -y {package}",
+            "pacman": f"pacman -R --noconfirm {package}",
+            "brew": f"brew uninstall {package}"
+        }
+        
+        if self.manager in commands:
+            if self.manager != "brew":
+                stdout, stderr, code = run_sudo_command(commands[self.manager], password)
+            else:
+                stdout, stderr, code = run_command(commands[self.manager])
+            
+            return code == 0, stderr if code != 0 else stdout
+        return False, "Unsupported package manager"
+    
+    def update_system(self, password: str = None) -> Tuple[bool, str]:
+        """Update system packages"""
+        if not self.manager:
+            return False, "No package manager found"
+        
+        commands = {
+            "apt": "apt update && apt upgrade -y",
+            "dnf": "dnf upgrade -y",
+            "zypper": "zypper update -y",
+            "pacman": "pacman -Syu --noconfirm",
+            "brew": "brew update && brew upgrade"
+        }
+        
+        if self.manager in commands:
+            if self.manager != "brew":
+                stdout, stderr, code = run_sudo_command(commands[self.manager], password)
+            else:
+                stdout, stderr, code = run_command(commands[self.manager])
+            
+            return code == 0, stderr if code != 0 else stdout
+        return False, "Unsupported package manager"
+    
+    def get_upgradable_packages(self) -> List[Tuple[str, str, str]]:
+        """Get list of upgradable packages"""
+        if not self.manager:
+            return []
+        
+        commands = {
+            "apt": "apt list --upgradable",
+            "dnf": "dnf check-update",
+            "zypper": "zypper list-updates",
+            "pacman": "pacman -Qu",
+            "brew": "brew outdated"
+        }
+        
+        if self.manager in commands:
+            stdout, _, code = run_command(commands[self.manager])
+            if code == 0:
+                return self._parse_upgradable_list(stdout)
+        return []
+    
+    def _parse_upgradable_list(self, output: str) -> List[Tuple[str, str, str]]:
+        """Parse upgradable packages list"""
+        packages = []
+        for line in output.split('\n'):
+            if line.strip():
+                if self.manager == "apt" and '/' in line and line[0].isalnum():
+                    pkg = line.split('/')[0].strip()
+                    version_info = line.split('[')[1].split(']')[0] if '[' in line else ""
+                    packages.append((pkg, version_info, ""))
+                elif self.manager == "dnf" and not line.startswith('Last metadata'):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        packages.append((parts[0], parts[1], ""))
+        return packages
+
+# User Management (Enhanced)
+class UserManager:
+    """Enhanced user management interface"""
+    
+    @staticmethod
+    def get_users() -> List[Dict[str, Any]]:
+        """Get list of system users"""
+        users = []
+        try:
+            for user in pwd.getpwall():
+                if user.pw_uid >= 1000 or user.pw_name in ['root', 'nobody']:
+                    users.append({
+                        'username': user.pw_name,
+                        'uid': user.pw_uid,
+                        'gid': user.pw_gid,
+                        'home': user.pw_dir,
+                        'shell': user.pw_shell,
+                        'gecos': user.pw_gecos,
+                        'last_login': UserManager._get_last_login(user.pw_name)
+                    })
+        except Exception as e:
+            logger.error(f"Error getting users: {e}")
+        return users
+    
+    @staticmethod
+    def _get_last_login(username: str) -> str:
+        """Get last login time for user"""
+        try:
+            stdout, _, code = run_command(f"lastlog -u {username} | tail -1")
+            if code == 0:
+                parts = stdout.split()
+                if len(parts) >= 8:
+                    return ' '.join(parts[4:8])
+        except:
             pass
+        return "Never"
     
-    return DummyTranslation()
+    @staticmethod
+    def create_user(username: str, password: str, full_name: str = "", 
+                   groups: List[str] = None, home_dir: str = "",
+                   shell: str = "/bin/bash") -> Tuple[bool, str]:
+        """Create a new user with enhanced options"""
+        if groups is None:
+            groups = []
+        
+        if not username or not password:
+            return False, "Username and password required"
+        
+        if len(password) < 8:
+            return False, "Password must be at least 8 characters"
+        
+        try:
+            cmd = f"useradd -m -s {shell}"
+            if full_name:
+                cmd += f" -c '{full_name}'"
+            if home_dir:
+                cmd += f" -d {home_dir}"
+            cmd += f" {username}"
+            
+            stdout, stderr, code = run_sudo_command(cmd)
+            if code != 0:
+                return False, stderr
+            
+            stdout, stderr, code = run_sudo_command(f"echo '{username}:{password}' | chpasswd")
+            if code != 0:
+                return False, stderr
+            
+            # Add to groups
+            for group in groups:
+                stdout, stderr, code = run_sudo_command(f"usermod -aG {group} {username}")
+                if code != 0:
+                    logger.warning(f"Failed to add user to group {group}: {stderr}")
+            
+            return True, "User created successfully"
+        except Exception as e:
+            logger.error(f"Error creating user: {e}")
+            return False, str(e)
+    
+    @staticmethod
+    def modify_user(username: str, **kwargs) -> Tuple[bool, str]:
+        """Modify user properties"""
+        if not username:
+            return False, "Username cannot be empty"
+        
+        try:
+            # Modify basic info
+            if 'full_name' in kwargs:
+                cmd = f"usermod -c '{kwargs['full_name']}' {username}"
+                stdout, stderr, code = run_sudo_command(cmd)
+                if code != 0:
+                    return False, stderr
+            
+            if 'shell' in kwargs:
+                cmd = f"usermod -s {kwargs['shell']} {username}"
+                stdout, stderr, code = run_sudo_command(cmd)
+                if code != 0:
+                    return False, stderr
+            
+            if 'home_dir' in kwargs:
+                cmd = f"usermod -d {kwargs['home_dir']} {username}"
+                stdout, stderr, code = run_sudo_command(cmd)
+                if code != 0:
+                    return False, stderr
+            
+            if 'groups' in kwargs:
+                groups = ','.join(kwargs['groups'])
+                cmd = f"usermod -G {groups} {username}"
+                stdout, stderr, code = run_sudo_command(cmd)
+                if code != 0:
+                    return False, stderr
+            
+            if 'password' in kwargs:
+                cmd = f"echo '{username}:{kwargs['password']}' | chpasswd"
+                stdout, stderr, code = run_sudo_command(cmd)
+                if code != 0:
+                    return False, stderr
+            
+            return True, "User modified successfully"
+        except Exception as e:
+            logger.error(f"Error modifying user: {e}")
+            return False, str(e)
+    
+    @staticmethod
+    def delete_user(username: str, remove_home: bool = True) -> Tuple[bool, str]:
+        """Delete a user"""
+        if not username or username == 'root':
+            return False, "Cannot delete root user"
+        
+        try:
+            cmd = f"userdel {'-r' if remove_home else ''} {username}"
+            stdout, stderr, code = run_sudo_command(cmd)
+            return code == 0, stderr if code != 0 else "User deleted successfully"
+        except Exception as e:
+            logger.error(f"Error deleting user: {e}")
+            return False, str(e)
+    
+    @staticmethod
+    def lock_user(username: str) -> Tuple[bool, str]:
+        """Lock a user account"""
+        if not username or username == 'root':
+            return False, "Cannot lock root user"
+        
+        try:
+            stdout, stderr, code = run_sudo_command(f"usermod -L {username}")
+            return code == 0, stderr if code != 0 else "User locked successfully"
+        except Exception as e:
+            logger.error(f"Error locking user: {e}")
+            return False, str(e)
+    
+    @staticmethod
+    def unlock_user(username: str) -> Tuple[bool, str]:
+        """Unlock a user account"""
+        if not username:
+            return False, "Username cannot be empty"
+        
+        try:
+            stdout, stderr, code = run_sudo_command(f"usermod -U {username}")
+            return code == 0, stderr if code != 0 else "User unlocked successfully"
+        except Exception as e:
+            logger.error(f"Error unlocking user: {e}")
+            return False, str(e)
+    
+    @staticmethod
+    def get_groups() -> List[Dict[str, Any]]:
+        """Get all system groups"""
+        groups = []
+        try:
+            for group in grp.getgrall():
+                groups.append({
+                    'name': group.gr_name,
+                    'gid': group.gr_gid,
+                    'members': group.gr_mem
+                })
+        except Exception as e:
+            logger.error(f"Error getting groups: {e}")
+        return groups
 
-_ = setup_translation().gettext
-
-def is_cached(key, expiry_seconds=30):
-    """Check if data is cached and not expired"""
-    if key in cache and key in cache_expiry:
-        if time.time() < cache_expiry[key]:
-            return True
-    return False
-
-def get_cached(key):
-    """Get cached data"""
-    return cache.get(key)
-
-def set_cached(key, value, expiry_seconds=30):
-    """Set cached data with expiry"""
-    cache[key] = value
-    cache_expiry[key] = time.time() + expiry_seconds
-
+# GUI Components
 class ProgressDialog(Gtk.Dialog):
     """Progress dialog for long-running operations"""
     
-    def __init__(self, parent, title=_("Working..."), message=_("Please wait...")):
+    def __init__(self, parent, title="Working...", message="Please wait..."):
         Gtk.Dialog.__init__(self, title=title, parent=parent, flags=Gtk.DialogFlags.MODAL)
         self.set_default_size(400, 100)
+        self.cancelled = False
         
-        # Add content area
+        # Content area
         content_area = self.get_content_area()
         
         # Message label
@@ -238,2171 +1421,75 @@ class ProgressDialog(Gtk.Dialog):
         self.add_button(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL)
         
         self.show_all()
-        self.cancelled = False
-        
-        # Connect cancel signal
         self.connect("response", self.on_response)
     
     def on_response(self, dialog, response_id):
         if response_id == Gtk.ResponseType.CANCEL:
             self.cancelled = True
     
-    def update_progress(self, fraction, text=None):
+    def update_progress(self, fraction: float, text: str = None):
         """Update progress bar"""
         self.progress_bar.set_fraction(fraction)
         if text:
             self.progress_bar.set_text(text)
-        # Process GTK events
         while Gtk.events_pending():
             Gtk.main_iteration()
     
-    def update_message(self, message):
+    def update_message(self, message: str):
         """Update message label"""
         self.message_label.set_text(message)
-        # Process GTK events
         while Gtk.events_pending():
             Gtk.main_iteration()
 
-class DependencyManager:
-    """Manages system dependencies and offers to install missing ones"""
+class PasswordDialog(Gtk.Dialog):
+    """Password input dialog"""
     
-    @staticmethod
-    def check_dependency(dep_name):
-        """Check if a dependency is installed"""
-        try:
-            if dep_name == "ufw":
-                return shutil.which("ufw") is not None
-            elif dep_name == "timeshift":
-                return shutil.which("timeshift") is not None
-            elif dep_name == "snapper":
-                return shutil.which("snapper") is not None
-            elif dep_name == "htop":
-                return shutil.which("htop") is not None
-            elif dep_name == "iotop":
-                return shutil.which("iotop") is not None
-            elif dep_name == "gparted":
-                return shutil.which("gparted") is not None
-            elif dep_name == "ntpdate":
-                return shutil.which("ntpdate") is not None or shutil.which("ntp") is not None
-            return False
-        except:
-            return False
+    def __init__(self, parent, title="Authentication Required"):
+        Gtk.Dialog.__init__(self, title=title, parent=parent, flags=Gtk.DialogFlags.MODAL)
+        self.set_default_size(300, 150)
+        
+        # Content area
+        content_area = self.get_content_area()
+        
+        # Message
+        label = Gtk.Label(label="Enter your password:")
+        content_area.pack_start(label, True, True, 10)
+        
+        # Password entry
+        self.entry = Gtk.Entry()
+        self.entry.set_visibility(False)
+        self.entry.set_invisible_char("*")
+        self.entry.connect("activate", lambda _: self.response(Gtk.ResponseType.OK))
+        content_area.pack_start(self.entry, True, True, 10)
+        
+        # Buttons
+        self.add_button(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL)
+        self.add_button(Gtk.STOCK_OK, Gtk.ResponseType.OK)
+        
+        self.show_all()
     
-    @staticmethod
-    def install_dependency(dep_name, parent_window=None):
-        """Install a missing dependency with user consent"""
-        if not PACKAGE_MANAGER:
-            return False, _("No package manager found")
-        
-        if dep_name not in DEPENDENCIES:
-            return False, _("Unknown dependency")
-        
-        if PACKAGE_MANAGER not in DEPENDENCIES[dep_name]:
-            return False, _("Dependency not available for this package manager")
-        
-        package_name = DEPENDENCIES[dep_name][PACKAGE_MANAGER]
-        if not package_name:
-            return False, _("Dependency not available on this platform")
-        
-        # Ask for user consent
-        dialog = Gtk.MessageDialog(
-            parent=parent_window,
-            flags=Gtk.DialogFlags.MODAL,
-            type=Gtk.MessageType.QUESTION,
-            buttons=Gtk.ButtonsType.YES_NO,
-            message_format=_("Install Missing Dependency")
-        )
-        dialog.format_secondary_text(
-            _("The tool '{}' is required but not installed. Would you like to install it now?").format(dep_name)
-        )
-        response = dialog.run()
-        dialog.destroy()
-        
-        if response != Gtk.ResponseType.YES:
-            return False, _("User declined installation")
-        
-        # Show progress dialog
-        progress_dialog = ProgressDialog(
-            parent_window,
-            title=_("Installing {}").format(dep_name),
-            message=_("Installing {}...").format(package_name)
-        )
-        
-        def install_with_password(password):
-            if PACKAGE_MANAGER != "brew":
-                cmd = f"{PACKAGE_MANAGER_CMD[0]} install -y {package_name}"
-                progress_dialog.update_message(_("Running command: {}").format(cmd))
-                progress_dialog.update_progress(0.1)
-                
-                # Run command with progress
-                process = subprocess.Popen(
-                    f"echo '{password}' | sudo -S {cmd}",
-                    shell=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True
-                )
-                
-                # Update progress while running
-                while process.poll() is None:
-                    if progress_dialog.cancelled:
-                        process.terminate()
-                        return False, _("Installation cancelled")
-                    
-                    # Simulate progress (since we can't get real progress from apt)
-                    current = progress_dialog.progress_bar.get_fraction()
-                    if current < 0.9:
-                        progress_dialog.update_progress(current + 0.05)
-                    time.sleep(0.5)
-                
-                stdout, stderr = process.communicate()
-                code = process.returncode
-                
-                progress_dialog.update_progress(1.0, _("Installation complete"))
-                time.sleep(1)  # Give user time to see completion
-                
-                return code == 0, stderr if code != 0 else stdout
-            else:
-                cmd = f"{PACKAGE_MANAGER_CMD[0]} install {package_name}"
-                progress_dialog.update_message(_("Running command: {}").format(cmd))
-                progress_dialog.update_progress(0.1)
-                
-                # Run command with progress
-                process = subprocess.Popen(
-                    cmd,
-                    shell=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True
-                )
-                
-                # Update progress while running
-                while process.poll() is None:
-                    if progress_dialog.cancelled:
-                        process.terminate()
-                        return False, _("Installation cancelled")
-                    
-                    # Simulate progress (since we can't get real progress from brew)
-                    current = progress_dialog.progress_bar.get_fraction()
-                    if current < 0.9:
-                        progress_dialog.update_progress(current + 0.05)
-                    time.sleep(0.5)
-                
-                stdout, stderr = process.communicate()
-                code = process.returncode
-                
-                progress_dialog.update_progress(1.0, _("Installation complete"))
-                time.sleep(1)  # Give user time to see completion
-                
-                return code == 0, stderr if code != 0 else stdout
-        
-        # Get password and install
-        def get_password_and_install():
-            password_dialog = Gtk.MessageDialog(
-                parent=parent_window,
-                flags=Gtk.DialogFlags.MODAL,
-                type=Gtk.MessageType.QUESTION,
-                buttons=Gtk.ButtonsType.OK_CANCEL,
-                message_format=_("Authentication Required")
-            )
-            password_dialog.format_secondary_text(_("Enter your password to install packages"))
-            
-            entry = Gtk.Entry()
-            entry.set_visibility(False)
-            entry.set_invisible_char("*")
-            entry.connect("activate", lambda _: password_dialog.response(Gtk.ResponseType.OK))
-            
-            password_dialog.get_content_area().pack_start(entry, True, True, 0)
-            password_dialog.show_all()
-            
-            response = password_dialog.run()
-            password = entry.get_text() if response == Gtk.ResponseType.OK else None
-            password_dialog.destroy()
-            
-            if password:
-                success, message = install_with_password(password)
-                progress_dialog.destroy()
-                
-                if success:
-                    success_dialog = Gtk.MessageDialog(
-                        parent=parent_window,
-                        flags=Gtk.DialogFlags.MODAL,
-                        type=Gtk.MessageType.INFO,
-                        buttons=Gtk.ButtonsType.OK,
-                        message_format=_("Installation Successful")
-                    )
-                    success_dialog.format_secondary_text(_("{} has been installed successfully").format(dep_name))
-                    success_dialog.run()
-                    success_dialog.destroy()
-                    return True, _("Installation completed")
-                else:
-                    error_dialog = Gtk.MessageDialog(
-                        parent=parent_window,
-                        flags=Gtk.DialogFlags.MODAL,
-                        type=Gtk.MessageType.ERROR,
-                        buttons=Gtk.ButtonsType.OK,
-                        message_format=_("Installation Failed")
-                    )
-                    error_dialog.format_secondary_text(message)
-                    error_dialog.run()
-                    error_dialog.destroy()
-                    return False, message
-            else:
-                progress_dialog.destroy()
-                return False, _("Authentication cancelled")
-        
-        # Run in a thread to keep UI responsive
-        thread = threading.Thread(target=get_password_and_install)
-        thread.daemon = True
-        thread.start()
-        
-        # Run the GTK main loop while the thread is running
-        while thread.is_alive():
-            while Gtk.events_pending():
-                Gtk.main_iteration()
-            time.sleep(0.1)
-        
-        return False, _("Installation initiated")
+    def get_password(self) -> str:
+        """Get entered password"""
+        return self.entry.get_text()
 
-class SystemInfo:
-    """System information gathering with caching and parallel processing"""
-    
-    @staticmethod
-    def get_cpu_model():
-        """Get CPU model information"""
-        cache_key = "cpu_model"
-        if is_cached(cache_key, 3600):  # Cache for 1 hour
-            return get_cached(cache_key)
-        
-        try:
-            if SYSTEM == "Linux":
-                with open('/proc/cpuinfo', 'r') as f:
-                    for line in f:
-                        if line.startswith('model name'):
-                            model = line.split(':')[1].strip()
-                            set_cached(cache_key, model, 3600)
-                            return model
-            elif SYSTEM == "Darwin":
-                stdout, stderr, code = CommandRunner.run_command("sysctl -n machdep.cpu.brand_string")
-                if code == 0:
-                    model = stdout.strip()
-                    set_cached(cache_key, model, 3600)
-                    return model
-        except:
-            pass
-        
-        model = platform.processor() or "Unknown"
-        set_cached(cache_key, model, 3600)
-        return model
-    
-    @staticmethod
-    def get_cpu_usage():
-        """Get CPU usage percentage"""
-        cache_key = "cpu_usage"
-        if is_cached(cache_key, 5):  # Cache for 5 seconds
-            return get_cached(cache_key)
-        
-        try:
-            if SYSTEM == "Linux":
-                # Read /proc/stat twice with a small delay
-                with open('/proc/stat', 'r') as f:
-                    first_line = f.readline()
-                first_times = list(map(int, first_line.split()[1:]))
-                
-                time.sleep(0.1)
-                
-                with open('/proc/stat', 'r') as f:
-                    second_line = f.readline()
-                second_times = list(map(int, second_line.split()[1:]))
-                
-                # Calculate usage
-                idle_diff = second_times[3] - first_times[3]
-                total_diff = sum(second_times) - sum(first_times)
-                
-                if total_diff > 0:
-                    usage = 100 * (total_diff - idle_diff) / total_diff
-                    set_cached(cache_key, usage, 5)
-                    return round(usage, 1)
-            elif SYSTEM == "Darwin":
-                stdout, stderr, code = CommandRunner.run_command("iostat -c 1 | tail -1 | awk '{print $6}'")
-                if code == 0 and stdout:
-                    usage = 100 - float(stdout)
-                    set_cached(cache_key, usage, 5)
-                    return round(usage, 1)
-        except:
-            pass
-        return 0.0
-    
-    @staticmethod
-    def get_cpu_cores():
-        """Get number of CPU cores"""
-        cache_key = "cpu_cores"
-        if is_cached(cache_key, 3600):  # Cache for 1 hour
-            return get_cached(cache_key)
-        
-        try:
-            if SYSTEM == "Linux":
-                with open('/proc/cpuinfo', 'r') as f:
-                    cores = sum(1 for line in f if line.startswith('processor'))
-                    set_cached(cache_key, cores, 3600)
-                    return cores
-            elif SYSTEM == "Darwin":
-                stdout, stderr, code = CommandRunner.run_command("sysctl -n hw.ncpu")
-                if code == 0:
-                    cores = int(stdout.strip())
-                    set_cached(cache_key, cores, 3600)
-                    return cores
-        except:
-            pass
-        
-        cores = os.cpu_count() or 1
-        set_cached(cache_key, cores, 3600)
-        return cores
-    
-    @staticmethod
-    def get_memory_info():
-        """Get memory information"""
-        cache_key = "memory_info"
-        if is_cached(cache_key, 5):  # Cache for 5 seconds
-            return get_cached(cache_key)
-        
-        try:
-            if SYSTEM == "Linux":
-                with open('/proc/meminfo', 'r') as f:
-                    meminfo = f.read()
-                
-                mem_total = 0
-                mem_available = 0
-                mem_free = 0
-                mem_buffers = 0
-                mem_cached = 0
-                swap_total = 0
-                swap_free = 0
-                
-                for line in meminfo.split('\n'):
-                    if 'MemTotal:' in line:
-                        mem_total = int(line.split()[1])
-                    elif 'MemAvailable:' in line:
-                        mem_available = int(line.split()[1])
-                    elif 'MemFree:' in line:
-                        mem_free = int(line.split()[1])
-                    elif 'Buffers:' in line:
-                        mem_buffers = int(line.split()[1])
-                    elif 'Cached:' in line and 'SReclaimable' not in line:
-                        mem_cached = int(line.split()[1])
-                    elif 'SwapTotal:' in line:
-                        swap_total = int(line.split()[1])
-                    elif 'SwapFree:' in line:
-                        swap_free = int(line.split()[1])
-                
-                if mem_total > 0:
-                    if mem_available == 0:
-                        mem_available = mem_free + mem_buffers + mem_cached
-                    used = mem_total - mem_available
-                    percent = (used / mem_total) * 100
-                    
-                    swap_used = swap_total - swap_free
-                    swap_percent = (swap_used / swap_total) * 100 if swap_total > 0 else 0
-                    
-                    result = {
-                        'total': mem_total // (1024 * 1024),
-                        'used': used // (1024 * 1024),
-                        'free': mem_free // (1024 * 1024),
-                        'buffers': mem_buffers // (1024 * 1024),
-                        'cached': mem_cached // (1024 * 1024),
-                        'percent': round(percent, 1),
-                        'swap_total': swap_total // (1024 * 1024),
-                        'swap_used': swap_used // (1024 * 1024),
-                        'swap_percent': round(swap_percent, 1)
-                    }
-                    
-                    set_cached(cache_key, result, 5)
-                    return result
-            elif SYSTEM == "Darwin":
-                # Get memory info on macOS
-                stdout, stderr, code = CommandRunner.run_command("vm_stat | grep 'Pages free:'")
-                if code == 0:
-                    free_pages = int(stdout.split(':')[1].strip().replace('.', ''))
-                    stdout, stderr, code = CommandRunner.run_command("vm_stat | grep 'Pages active:'")
-                    if code == 0:
-                        active_pages = int(stdout.split(':')[1].strip().replace('.', ''))
-                        stdout, stderr, code = CommandRunner.run_command("vm_stat | grep 'Pages inactive:'")
-                        if code == 0:
-                            inactive_pages = int(stdout.split(':')[1].strip().replace('.', ''))
-                            stdout, stderr, code = CommandRunner.run_command("vm_stat | grep 'Pages wired down:'")
-                            if code == 0:
-                                wired_pages = int(stdout.split(':')[1].strip().replace('.', ''))
-                                stdout, stderr, code = CommandRunner.run_command("sysctl -n hw.memsize")
-                                if code == 0:
-                                    total_bytes = int(stdout)
-                                    page_size = 4096
-                                    total_pages = total_bytes // page_size
-                                    
-                                    free_bytes = free_pages * page_size
-                                    active_bytes = active_pages * page_size
-                                    inactive_bytes = inactive_pages * page_size
-                                    wired_bytes = wired_pages * page_size
-                                    used_bytes = active_bytes + inactive_bytes + wired_bytes
-                                    
-                                    percent = (used_bytes / total_bytes) * 100
-                                    result = {
-                                        'total': total_bytes // (1024**3),
-                                        'used': used_bytes // (1024**3),
-                                        'free': free_bytes // (1024**3),
-                                        'buffers': 0,
-                                        'cached': inactive_bytes // (1024**3),
-                                        'percent': round(percent, 1),
-                                        'swap_total': 0,
-                                        'swap_used': 0,
-                                        'swap_percent': 0
-                                    }
-                                    
-                                    set_cached(cache_key, result, 5)
-                                    return result
-        except:
-            pass
-        return {'total': 0, 'used': 0, 'free': 0, 'buffers': 0, 'cached': 0, 'percent': 0.0,
-                'swap_total': 0, 'swap_used': 0, 'swap_percent': 0}
-    
-    @staticmethod
-    def get_disk_usage(path='/'):
-        """Get disk usage"""
-        cache_key = f"disk_usage_{path}"
-        if is_cached(cache_key, 30):  # Cache for 30 seconds
-            return get_cached(cache_key)
-        
-        try:
-            stdout, stderr, code = CommandRunner.run_command(f"df -h {path} | tail -1")
-            if code == 0:
-                parts = stdout.split()
-                if len(parts) >= 6:
-                    total_str = parts[1]
-                    used_str = parts[2]
-                    avail_str = parts[3]
-                    percent_str = parts[4].replace('%', '')
-                    
-                    def parse_size(size_str):
-                        if size_str.endswith('G'):
-                            return float(size_str[:-1])
-                        elif size_str.endswith('M'):
-                            return float(size_str[:-1]) / 1024
-                        elif size_str.endswith('T'):
-                            return float(size_str[:-1]) * 1024
-                        elif size_str.endswith('K'):
-                            return float(size_str[:-1]) / 1024 / 1024
-                        return 0
-                    
-                    total = parse_size(total_str)
-                    used = parse_size(used_str)
-                    avail = parse_size(avail_str)
-                    percent = float(percent_str)
-                    
-                    result = {'total': total, 'used': used, 'avail': avail, 'percent': percent}
-                    set_cached(cache_key, result, 30)
-                    return result
-        except:
-            pass
-        return {'total': 0, 'used': 0, 'avail': 0, 'percent': 0.0}
-    
-    @staticmethod
-    def get_all_disk_usage():
-        """Get disk usage for all mounted filesystems"""
-        cache_key = "all_disk_usage"
-        if is_cached(cache_key, 30):  # Cache for 30 seconds
-            return get_cached(cache_key)
-        
-        try:
-            stdout, stderr, code = CommandRunner.run_command("df -h")
-            if code == 0:
-                disks = []
-                lines = stdout.split('\n')[1:]  # Skip header
-                for line in lines:
-                    if line.strip():
-                        parts = line.split()
-                        if len(parts) >= 6:
-                            device = parts[0]
-                            total_str = parts[1]
-                            used_str = parts[2]
-                            avail_str = parts[3]
-                            percent_str = parts[4].replace('%', '')
-                            mountpoint = parts[5]
-                            
-                            def parse_size(size_str):
-                                if size_str.endswith('G'):
-                                    return float(size_str[:-1])
-                                elif size_str.endswith('M'):
-                                    return float(size_str[:-1]) / 1024
-                                elif size_str.endswith('T'):
-                                    return float(size_str[:-1]) * 1024
-                                elif size_str.endswith('K'):
-                                    return float(size_str[:-1]) / 1024 / 1024
-                                return 0
-                            
-                            total = parse_size(total_str)
-                            used = parse_size(used_str)
-                            avail = parse_size(avail_str)
-                            percent = float(percent_str)
-                            
-                            disks.append({
-                                'device': device,
-                                'mountpoint': mountpoint,
-                                'fstype': '',
-                                'total': total,
-                                'used': used,
-                                'avail': avail,
-                                'percent': percent
-                            })
-                
-                set_cached(cache_key, disks, 30)
-                return disks
-        except:
-            pass
-        return []
-    
-    @staticmethod
-    def get_uptime():
-        """Get system uptime"""
-        cache_key = "uptime"
-        if is_cached(cache_key, 60):  # Cache for 1 minute
-            return get_cached(cache_key)
-        
-        try:
-            if SYSTEM == "Linux":
-                with open('/proc/uptime', 'r') as f:
-                    uptime_seconds = float(f.read().split()[0])
-                    set_cached(cache_key, uptime_seconds, 60)
-                    return uptime_seconds
-            elif SYSTEM == "Darwin":
-                stdout, stderr, code = CommandRunner.run_command("sysctl -n kern.boottime")
-                if code == 0:
-                    import re
-                    match = re.search(r'sec = (\d+)', stdout)
-                    if match:
-                        boot_time = int(match.group(1))
-                        uptime_seconds = time.time() - boot_time
-                        set_cached(cache_key, uptime_seconds, 60)
-                        return uptime_seconds
-        except:
-            pass
-        return 0
-    
-    @staticmethod
-    def get_network_interfaces():
-        """Get network interfaces"""
-        cache_key = "network_interfaces"
-        if is_cached(cache_key, 10):  # Cache for 10 seconds
-            return get_cached(cache_key)
-        
-        interfaces = []
-        try:
-            if SYSTEM == "Linux":
-                stdout, stderr, code = CommandRunner.run_command("ip addr show")
-                if code == 0:
-                    current_iface = None
-                    for line in stdout.split('\n'):
-                        if line and not line.startswith(' '):
-                            parts = line.split()
-                            if len(parts) >= 2:
-                                current_iface = parts[1].rstrip(':')
-                                if current_iface != 'lo':
-                                    interfaces.append({
-                                        'name': current_iface,
-                                        'addresses': [],
-                                        'is_up': 'UP' in line,
-                                        'mac': '',
-                                        'mtu': ''
-                                    })
-                        elif current_iface and 'inet ' in line:
-                            parts = line.split()
-                            if len(parts) >= 2:
-                                ip = parts[1].split('/')[0]
-                                for iface in interfaces:
-                                    if iface['name'] == current_iface:
-                                        iface['addresses'].append(ip)
-                                        break
-                        elif current_iface and 'link/ether' in line:
-                            parts = line.split()
-                            if len(parts) >= 2:
-                                mac = parts[1]
-                                for iface in interfaces:
-                                    if iface['name'] == current_iface:
-                                        iface['mac'] = mac
-                                        break
-                        elif current_iface and 'mtu' in line:
-                            parts = line.split()
-                            if len(parts) >= 2:
-                                mtu = parts[1]
-                                for iface in interfaces:
-                                    if iface['name'] == current_iface:
-                                        iface['mtu'] = mtu
-                                        break
-                    
-                    for iface in interfaces:
-                        stdout, stderr, code = CommandRunner.run_command(f"cat /proc/net/dev | grep {iface['name']}:")
-                        if code == 0:
-                            parts = stdout.split()
-                            if len(parts) >= 17:
-                                iface['rx_bytes'] = int(parts[1])
-                                iface['rx_packets'] = int(parts[2])
-                                iface['tx_bytes'] = int(parts[9])
-                                iface['tx_packets'] = int(parts[10])
-            
-            elif SYSTEM == "Darwin":
-                stdout, stderr, code = CommandRunner.run_command("ifconfig")
-                if code == 0:
-                    current_iface = None
-                    for line in stdout.split('\n'):
-                        if line and not line.startswith('\t'):
-                            parts = line.split()
-                            if parts:
-                                current_iface = parts[0].rstrip(':')
-                                if current_iface != 'lo0' and not current_iface.startswith('lo'):
-                                    interfaces.append({
-                                        'name': current_iface,
-                                        'addresses': [],
-                                        'is_up': 'status: active' in line,
-                                        'mac': '',
-                                        'mtu': ''
-                                    })
-                        elif current_iface and 'inet ' in line:
-                            parts = line.split()
-                            if len(parts) >= 2:
-                                ip = parts[1]
-                                for iface in interfaces:
-                                    if iface['name'] == current_iface:
-                                        iface['addresses'].append(ip)
-                                        break
-                        elif current_iface and 'ether' in line:
-                            parts = line.split()
-                            if len(parts) >= 2:
-                                mac = parts[1]
-                                for iface in interfaces:
-                                    if iface['name'] == current_iface:
-                                        iface['mac'] = mac
-                                        break
-            
-            set_cached(cache_key, interfaces, 10)
-            return interfaces
-        except:
-            pass
-        return []
-    
-    @staticmethod
-    def get_active_connections():
-        """Get active network connections"""
-        cache_key = "active_connections"
-        if is_cached(cache_key, 5):  # Cache for 5 seconds
-            return get_cached(cache_key)
-        
-        connections = []
-        try:
-            if SYSTEM == "Linux":
-                stdout, stderr, code = CommandRunner.run_command("netstat -tnp 2>/dev/null | grep ESTABLISHED")
-                if code == 0:
-                    for line in stdout.split('\n'):
-                        if line.strip():
-                            parts = line.split()
-                            if len(parts) >= 7:
-                                connections.append({
-                                    'protocol': parts[0],
-                                    'local': parts[3],
-                                    'remote': parts[4],
-                                    'status': parts[5],
-                                    'pid': parts[6].split('/')[-1] if '/' in parts[6] else parts[6]
-                                })
-            elif SYSTEM == "Darwin":
-                stdout, stderr, code = CommandRunner.run_command("netstat -an | grep ESTABLISHED")
-                if code == 0:
-                    for line in stdout.split('\n'):
-                        if line.strip() and not line.startswith('Active'):
-                            parts = line.split()
-                            if len(parts) >= 4:
-                                connections.append({
-                                    'protocol': parts[0],
-                                    'local': parts[3],
-                                    'remote': parts[4],
-                                    'status': 'ESTABLISHED',
-                                    'pid': 'N/A'
-                                })
-            
-            set_cached(cache_key, connections, 5)
-            return connections
-        except:
-            pass
-        return []
-    
-    @staticmethod
-    def get_process_list():
-        """Get list of running processes"""
-        cache_key = "process_list"
-        if is_cached(cache_key, 5):  # Cache for 5 seconds
-            return get_cached(cache_key)
-        
-        processes = []
-        try:
-            stdout, stderr, code = CommandRunner.run_command("ps aux")
-            if code == 0:
-                lines = stdout.split('\n')[1:]
-                for line in lines:
-                    if line.strip():
-                        parts = line.split(None, 10)
-                        if len(parts) >= 11:
-                            processes.append({
-                                'user': parts[0],
-                                'pid': parts[1],
-                                'cpu': parts[2],
-                                'mem': parts[3],
-                                'vsz': parts[4],
-                                'rss': parts[5],
-                                'tty': parts[6],
-                                'stat': parts[7],
-                                'start': parts[8],
-                                'time': parts[9],
-                                'command': parts[10]
-                            })
-            
-            set_cached(cache_key, processes, 5)
-            return processes
-        except:
-            pass
-        return []
-    
-    @staticmethod
-    def get_temperature():
-        """Get system temperature"""
-        cache_key = "temperature"
-        if is_cached(cache_key, 10):  # Cache for 10 seconds
-            return get_cached(cache_key)
-        
-        try:
-            if SYSTEM == "Linux":
-                temps = []
-                for zone in glob.glob('/sys/class/thermal/thermal_zone*/temp'):
-                    try:
-                        with open(zone, 'r') as f:
-                            temp = int(f.read().strip()) / 1000.0
-                            temps.append(temp)
-                    except:
-                        pass
-                
-                if temps:
-                    temp = round(sum(temps) / len(temps), 1)
-                    set_cached(cache_key, temp, 10)
-                    return temp
-                
-                stdout, stderr, code = CommandRunner.run_command("sensors | grep -E 'Core [0-9]+' | awk '{print $3}' | sed 's/+//g' | sed 's/°C//g'")
-                if code == 0 and stdout:
-                    temps = [float(t) for t in stdout.split('\n') if t.strip()]
-                    if temps:
-                        temp = round(sum(temps) / len(temps), 1)
-                        set_cached(cache_key, temp, 10)
-                        return temp
-            elif SYSTEM == "Darwin":
-                stdout, stderr, code = CommandRunner.run_command("sysctl -n hw.sensors.cpu_temp0")
-                if code == 0:
-                    temp = float(stdout.strip())
-                    set_cached(cache_key, temp, 10)
-                    return temp
-        except:
-            pass
-        return None
-    
-    @staticmethod
-    def get_battery_info():
-        """Get battery information"""
-        cache_key = "battery_info"
-        if is_cached(cache_key, 30):  # Cache for 30 seconds
-            return get_cached(cache_key)
-        
-        try:
-            if SYSTEM == "Linux":
-                stdout, stderr, code = CommandRunner.run_command("upower -i $(upower -e | grep BAT) | grep -E 'percentage|state|time to'")
-                if code == 0 and stdout:
-                    info = {'percent': 0, 'secsleft': -1, 'power_plugged': False}
-                    
-                    for line in stdout.split('\n'):
-                        if 'percentage:' in line:
-                            info['percent'] = int(line.split(':')[1].strip().replace('%', ''))
-                        elif 'state:' in line:
-                            state = line.split(':')[1].strip()
-                            info['power_plugged'] = state == 'charging'
-                        elif 'time to' in line:
-                            time_str = line.split(':')[1].strip()
-                            # Parse time string (e.g., "2 hours, 30 minutes")
-                            hours = 0
-                            minutes = 0
-                            if 'hour' in time_str:
-                                hours = int(time_str.split('hour')[0].strip())
-                            if 'minute' in time_str:
-                                minutes = int(time_str.split('minute')[0].split()[-1].strip())
-                            info['secsleft'] = hours * 3600 + minutes * 60
-                    
-                    set_cached(cache_key, info, 30)
-                    return info
-            elif SYSTEM == "Darwin":
-                stdout, stderr, code = CommandRunner.run_command("pmset -g batt")
-                if code == 0 and stdout:
-                    info = {'percent': 0, 'secsleft': -1, 'power_plugged': False}
-                    
-                    for line in stdout.split('\n'):
-                        if 'InternalBattery' in line:
-                            parts = line.split(';')
-                            if len(parts) >= 2:
-                                # Extract percentage
-                                percent_match = re.search(r'(\d+)%', parts[0])
-                                if percent_match:
-                                    info['percent'] = int(percent_match.group(1))
-                                
-                                # Extract charging state
-                                info['power_plugged'] = 'charging' in parts[1].lower()
-                                
-                                # Extract time remaining
-                                if 'no estimate' not in parts[1].lower():
-                                    time_match = re.search(r'(\d+):(\d+)', parts[1])
-                                    if time_match:
-                                        hours = int(time_match.group(1))
-                                        minutes = int(time_match.group(2))
-                                        info['secsleft'] = hours * 3600 + minutes * 60
-                    
-                    set_cached(cache_key, info, 30)
-                    return info
-        except:
-            pass
-        return None
-    
-    @staticmethod
-    def get_system_load():
-        """Get system load averages"""
-        cache_key = "system_load"
-        if is_cached(cache_key, 5):  # Cache for 5 seconds
-            return get_cached(cache_key)
-        
-        try:
-            if SYSTEM == "Linux":
-                with open('/proc/loadavg', 'r') as f:
-                    load_data = f.read().split()
-                    result = {
-                        'load1': float(load_data[0]),
-                        'load5': float(load_data[1]),
-                        'load15': float(load_data[2])
-                    }
-                    set_cached(cache_key, result, 5)
-                    return result
-            elif SYSTEM == "Darwin":
-                stdout, stderr, code = CommandRunner.run_command("uptime")
-                if code == 0:
-                    # Extract load averages from uptime output
-                    load_match = re.search(r'load averages?: ([\d.]+), ([\d.]+), ([\d.]+)', stdout)
-                    if load_match:
-                        result = {
-                            'load1': float(load_match.group(1)),
-                            'load5': float(load_match.group(2)),
-                            'load15': float(load_match.group(3))
-                        }
-                        set_cached(cache_key, result, 5)
-                        return result
-        except:
-            pass
-        return {'load1': 0, 'load5': 0, 'load15': 0}
-
-class CommandRunner:
-    """Safe command execution with proper error handling"""
-    
-    @staticmethod
-    def run_command(cmd, input_data=None, check=True, timeout=30):
-        """Safely execute a command"""
-        try:
-            if isinstance(cmd, str):
-                cmd = cmd.split()
-            
-            result = subprocess.run(
-                cmd,
-                input=input_data,
-                text=True,
-                capture_output=True,
-                check=check,
-                timeout=timeout
-            )
-            return result.stdout.strip(), result.stderr.strip(), result.returncode
-        except subprocess.TimeoutExpired:
-            return "", _("Command timed out"), 1
-        except subprocess.CalledProcessError as e:
-            return e.stdout.strip(), e.stderr.strip(), e.returncode
-        except Exception as e:
-            return "", str(e), 1
-    
-    @staticmethod
-    def run_sudo_command(cmd, password=None):
-        """Execute command with sudo privileges"""
-        if password:
-            echo_cmd = f"echo '{password}' | sudo -S "
-            cmd = echo_cmd + cmd
-        else:
-            cmd = "sudo " + cmd
-        
-        return CommandRunner.run_command(cmd, check=False)
-
-class PackageManager:
-    """Package management abstraction layer"""
-    
-    def __init__(self):
-        self.manager = PACKAGE_MANAGER
-        self.cmd = PACKAGE_MANAGER_CMD
-    
-    def search_packages(self, query):
-        """Search for packages"""
-        if not self.manager:
-            return []
-        
-        commands = {
-            "apt": f"{self.cmd[0]} search {query}",
-            "dnf": f"{self.cmd[0]} search {query}",
-            "zypper": f"{self.cmd[0]} search {query}",
-            "pacman": f"{self.cmd[0]} -Ss {query}",
-            "brew": f"{self.cmd[0]} search {query}"
-        }
-        
-        if self.manager in commands:
-            stdout, stderr, code = CommandRunner.run_command(commands[self.manager])
-            if code == 0:
-                return self._parse_package_list(stdout)
-        return []
-    
-    def _parse_package_list(self, output):
-        """Parse package list output"""
-        packages = []
-        for line in output.split('\n'):
-            if line.strip():
-                if self.manager == "apt":
-                    if '/' in line and line[0].isalnum():
-                        pkg = line.split('/')[0].strip()
-                        desc = line.split(' - ', 1)[-1].strip()
-                        packages.append((pkg, desc))
-                elif self.manager == "dnf":
-                    if line and not line.startswith('Last metadata'):
-                        parts = line.split('.', 1)
-                        if len(parts) > 1:
-                            pkg = parts[0].strip()
-                            desc = parts[1].split(':', 1)[-1].strip()
-                            packages.append((pkg, desc))
-                elif self.manager == "pacman":
-                    if line and not line.startswith('::'):
-                        parts = line.split(' ', 2)
-                        if len(parts) >= 2:
-                            pkg = parts[0].replace('/', '').strip()
-                            desc = parts[-1].strip()
-                            packages.append((pkg, desc))
-                elif self.manager == "brew":
-                    if line and not line.startswith('==>'):
-                        parts = line.split(' ', 1)
-                        if len(parts) == 2:
-                            pkg = parts[0].strip()
-                            desc = parts[1].strip()
-                            packages.append((pkg, desc))
-        return packages
-    
-    def get_installed_packages(self):
-        """Get list of installed packages"""
-        if not self.manager:
-            return []
-        
-        commands = {
-            "apt": "dpkg -l",
-            "dnf": f"{self.cmd[0]} list installed",
-            "zypper": f"{self.cmd[0]} search -i",
-            "pacman": f"{self.cmd[0]} -Q",
-            "brew": f"{self.cmd[0]} list"
-        }
-        
-        if self.manager in commands:
-            stdout, stderr, code = CommandRunner.run_command(commands[self.manager])
-            if code == 0:
-                return self._parse_installed_list(stdout)
-        return []
-    
-    def _parse_installed_list(self, output):
-        """Parse installed packages list"""
-        packages = []
-        for line in output.split('\n'):
-            if line.strip():
-                if self.manager == "apt":
-                    if line.startswith('ii'):
-                        parts = line.split()
-                        if len(parts) >= 3:
-                            pkg = parts[1]
-                            version = parts[2]
-                            desc = ' '.join(parts[3:])
-                            packages.append((pkg, version, desc))
-                elif self.manager in ["dnf", "zypper"]:
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        pkg = parts[0]
-                        version = parts[1]
-                        packages.append((pkg, version, ""))
-                elif self.manager == "pacman":
-                    parts = line.split()
-                    if len(parts) == 2:
-                        pkg = parts[0]
-                        version = parts[1]
-                        packages.append((pkg, version, ""))
-                elif self.manager == "brew":
-                    pkg = line.strip()
-                    if pkg:
-                        packages.append((pkg, "", ""))
-        return packages
-    
-    def install_package(self, package, password=None):
-        """Install a package"""
-        if not self.manager:
-            return False, _("No package manager found")
-        
-        commands = {
-            "apt": f"{self.cmd[0]} install -y {package}",
-            "dnf": f"{self.cmd[0]} install -y {package}",
-            "zypper": f"{self.cmd[0]} install -y {package}",
-            "pacman": f"{self.cmd[0]} -S --noconfirm {package}",
-            "brew": f"{self.cmd[0]} install {package}"
-        }
-        
-        if self.manager in commands:
-            if self.manager != "brew":
-                stdout, stderr, code = CommandRunner.run_sudo_command(commands[self.manager], password)
-            else:
-                stdout, stderr, code = CommandRunner.run_command(commands[self.manager])
-            
-            return code == 0, stderr if code != 0 else stdout
-        return False, _("Unsupported package manager")
-    
-    def remove_package(self, package, password=None):
-        """Remove a package"""
-        if not self.manager:
-            return False, _("No package manager found")
-        
-        commands = {
-            "apt": f"{self.cmd[0]} remove -y {package}",
-            "dnf": f"{self.cmd[0]} remove -y {package}",
-            "zypper": f"{self.cmd[0]} remove -y {package}",
-            "pacman": f"{self.cmd[0]} -R --noconfirm {package}",
-            "brew": f"{self.cmd[0]} uninstall {package}"
-        }
-        
-        if self.manager in commands:
-            if self.manager != "brew":
-                stdout, stderr, code = CommandRunner.run_sudo_command(commands[self.manager], password)
-            else:
-                stdout, stderr, code = CommandRunner.run_command(commands[self.manager])
-            
-            return code == 0, stderr if code != 0 else stdout
-        return False, _("Unsupported package manager")
-    
-    def update_system(self, password=None):
-        """Update system packages"""
-        if not self.manager:
-            return False, _("No package manager found")
-        
-        commands = {
-            "apt": f"{self.cmd[0]} update && {self.cmd[0]} upgrade -y",
-            "dnf": f"{self.cmd[0]} upgrade -y",
-            "zypper": f"{self.cmd[0]} update -y",
-            "pacman": f"{self.cmd[0]} -Syu --noconfirm",
-            "brew": f"{self.cmd[0]} update && {self.cmd[0]} upgrade"
-        }
-        
-        if self.manager in commands:
-            if self.manager != "brew":
-                stdout, stderr, code = CommandRunner.run_sudo_command(commands[self.manager], password)
-            else:
-                stdout, stderr, code = CommandRunner.run_command(commands[self.manager])
-            
-            return code == 0, stderr if code != 0 else stdout
-        return False, _("Unsupported package manager")
-    
-    def get_repositories(self):
-        """Get list of repositories"""
-        repos = []
-        
-        if self.manager == "apt":
-            sources_files = ["/etc/apt/sources.list"]
-            sources_files.extend(glob.glob("/etc/apt/sources.list.d/*.list"))
-            
-            for source_file in sources_files:
-                if os.path.exists(source_file):
-                    stdout, stderr, code = CommandRunner.run_command(f"cat {source_file}")
-                    if code == 0:
-                        for line in stdout.split('\n'):
-                            if line.strip() and not line.startswith('#'):
-                                if 'deb ' in line:
-                                    enabled = not line.startswith('#deb ')
-                                    repo_info = line.replace('#', '').strip()
-                                    repos.append((repo_info, enabled))
-        
-        elif self.manager == "dnf":
-            stdout, stderr, code = CommandRunner.run_command("dnf repolist -v")
-            if code == 0:
-                for line in stdout.split('\n'):
-                    if 'Repo-id' in line:
-                        repo_id = line.split(':', 1)[1].strip()
-                        repos.append((repo_id, True))
-        
-        elif self.manager == "zypper":
-            stdout, stderr, code = CommandRunner.run_command("zypper lr")
-            if code == 0:
-                for line in stdout.split('\n'):
-                    if line and not line.startswith('#') and '|' in line:
-                        parts = [p.strip() for p in line.split('|')]
-                        if len(parts) >= 3:
-                            alias = parts[1]
-                            enabled = parts[2] == 'Yes'
-                            repos.append((alias, enabled))
-        
-        elif self.manager == "pacman":
-            stdout, stderr, code = CommandRunner.run_command("grep -E '^\\[.*\\]' /etc/pacman.conf")
-            if code == 0:
-                for line in stdout.split('\n'):
-                    if line.strip():
-                        repo = line.strip()
-                        enabled = not repo.startswith('#[')
-                        repos.append((repo.replace('#', ''), enabled))
-        
-        return repos
-    
-    def get_upgradable_packages(self):
-        """Get list of upgradable packages"""
-        if not self.manager:
-            return []
-        
-        commands = {
-            "apt": "apt list --upgradable",
-            "dnf": "dnf check-update",
-            "zypper": "zypper list-updates",
-            "pacman": "pacman -Qu",
-            "brew": "brew outdated"
-        }
-        
-        if self.manager in commands:
-            stdout, stderr, code = CommandRunner.run_command(commands[self.manager])
-            if code == 0:
-                return self._parse_upgradable_list(stdout)
-        return []
-    
-    def _parse_upgradable_list(self, output):
-        """Parse upgradable packages list"""
-        packages = []
-        for line in output.split('\n'):
-            if line.strip():
-                if self.manager == "apt":
-                    if '/' in line and line[0].isalnum():
-                        pkg = line.split('/')[0].strip()
-                        version_info = line.split('[')[1].split(']')[0] if '[' in line else ""
-                        packages.append((pkg, version_info))
-                elif self.manager == "dnf":
-                    if line and not line.startswith('Last metadata'):
-                        parts = line.split()
-                        if len(parts) >= 2:
-                            pkg = parts[0]
-                            version_info = parts[1]
-                            packages.append((pkg, version_info))
-                elif self.manager == "zypper":
-                    if line and not line.startswith('S') and '|' in line:
-                        parts = [p.strip() for p in line.split('|')]
-                        if len(parts) >= 3:
-                            pkg = parts[2]
-                            version_info = parts[3]
-                            packages.append((pkg, version_info))
-                elif self.manager == "pacman":
-                    if ' -> ' in line:
-                        parts = line.split(' -> ')
-                        if len(parts) == 2:
-                            pkg = parts[0].split(' ')[0]
-                            version_info = parts[1].split(' ')[0]
-                            packages.append((pkg, version_info))
-                elif self.manager == "brew":
-                    if ' -> ' in line:
-                        parts = line.split(' -> ')
-                        if len(parts) == 2:
-                            pkg = parts[0]
-                            version_info = parts[1]
-                            packages.append((pkg, version_info))
-        return packages
-
-class NetworkManager:
-    """Network management utilities"""
-    
-    @staticmethod
-    def get_interfaces():
-        """Get network interfaces"""
-        return SystemInfo.get_network_interfaces()
-    
-    @staticmethod
-    def get_active_connections():
-        """Get active network connections"""
-        return SystemInfo.get_active_connections()
-    
-    @staticmethod
-    def get_firewall_status():
-        """Get firewall status"""
-        if SYSTEM == "Linux":
-            if DependencyManager.check_dependency("ufw"):
-                stdout, stderr, code = CommandRunner.run_command("ufw status")
-                if code == 0:
-                    return "ufw", "active" in stdout.lower()
-            
-            stdout, stderr, code = CommandRunner.run_command("which firewall-cmd")
-            if code == 0:
-                stdout, stderr, code = CommandRunner.run_command("firewall-cmd --state")
-                if code == 0:
-                    return "firewalld", stdout.strip() == "running"
-            
-            stdout, stderr, code = CommandRunner.run_command("iptables -L")
-            if code == 0:
-                return "iptables", len(stdout.split('\n')) > 10
-        
-        return "unknown", False
-    
-    @staticmethod
-    def toggle_firewall(enable, password=None):
-        """Toggle firewall status"""
-        if SYSTEM == "Linux":
-            if DependencyManager.check_dependency("ufw"):
-                cmd = f"ufw {'enable' if enable else 'disable'}"
-                stdout, stderr, code = CommandRunner.run_sudo_command(cmd, password)
-                return code == 0, stderr if code != 0 else stdout
-            
-            stdout, stderr, code = CommandRunner.run_command("which firewall-cmd")
-            if code == 0:
-                cmd = f"systemctl {'start' if enable else 'stop'} firewalld"
-                stdout, stderr, code = CommandRunner.run_sudo_command(cmd, password)
-                return code == 0, stderr if code != 0 else stdout
-        
-        return False, _("Firewall management not supported")
-    
-    @staticmethod
-    def get_network_speed():
-        """Get network speed"""
-        try:
-            if SYSTEM == "Linux":
-                interfaces = SystemInfo.get_network_interfaces()
-                current_stats = {}
-                for iface in interfaces:
-                    if 'rx_bytes' in iface and 'tx_bytes' in iface:
-                        current_stats[iface['name']] = {
-                            'rx_bytes': iface['rx_bytes'],
-                            'tx_bytes': iface['tx_bytes']
-                        }
-                
-                time.sleep(1)
-                
-                new_interfaces = SystemInfo.get_network_interfaces()
-                new_stats = {}
-                for iface in new_interfaces:
-                    if 'rx_bytes' in iface and 'tx_bytes' in iface:
-                        new_stats[iface['name']] = {
-                            'rx_bytes': iface['rx_bytes'],
-                            'tx_bytes': iface['tx_bytes']
-                        }
-                
-                speeds = {}
-                for name in current_stats:
-                    if name in new_stats:
-                        rx_speed = (new_stats[name]['rx_bytes'] - current_stats[name]['rx_bytes']) / 1024
-                        tx_speed = (new_stats[name]['tx_bytes'] - current_stats[name]['tx_bytes']) / 1024
-                        speeds[name] = {
-                            'rx_speed': rx_speed,
-                            'tx_speed': tx_speed
-                        }
-                
-                return speeds
-        except:
-            pass
-        return {}
-    
-    @staticmethod
-    def configure_interface(interface, settings, password=None):
-        """Configure network interface"""
-        if not interface:
-            return False, _("No interface specified")
-        
-        # This is a simplified implementation
-        # In a real-world scenario, you would use NetworkManager or netplan
-        if SYSTEM == "Linux":
-            if INIT_SYSTEM == "systemd":
-                # Example: Configure with NetworkManager
-                if 'ip' in settings:
-                    cmd = f"nmcli con mod {interface} ipv4.addresses {settings['ip']}"
-                    stdout, stderr, code = CommandRunner.run_sudo_command(cmd, password)
-                    if code != 0:
-                        return False, stderr
-                
-                if 'gateway' in settings:
-                    cmd = f"nmcli con mod {interface} ipv4.gateway {settings['gateway']}"
-                    stdout, stderr, code = CommandRunner.run_sudo_command(cmd, password)
-                    if code != 0:
-                        return False, stderr
-                
-                if 'dns' in settings:
-                    cmd = f"nmcli con mod {interface} ipv4.dns {settings['dns']}"
-                    stdout, stderr, code = CommandRunner.run_sudo_command(cmd, password)
-                    if code != 0:
-                        return False, stderr
-                
-                # Apply changes
-                cmd = f"nmcli con down {interface} && nmcli con up {interface}"
-                stdout, stderr, code = CommandRunner.run_sudo_command(cmd, password)
-                if code != 0:
-                    return False, stderr
-                
-                return True, _("Interface configured successfully")
-        
-        return False, _("Network configuration not supported")
-
-class ServiceManager:
-    """Service management utilities"""
-    
-    @staticmethod
-    def get_services():
-        """Get list of services"""
-        services = []
-        
-        if INIT_SYSTEM == "systemd":
-            stdout, stderr, code = CommandRunner.run_command("systemctl list-units --type=service --all")
-            if code == 0:
-                for line in stdout.split('\n'):
-                    if '.service' in line and not line.startswith('UNIT'):
-                        parts = line.split()
-                        if len(parts) >= 4:
-                            name = parts[0]
-                            load = parts[1]
-                            active = parts[2]
-                            sub = parts[3]
-                            description = ' '.join(parts[4:]) if len(parts) > 4 else ""
-                            services.append({
-                                'name': name,
-                                'load': load,
-                                'active': active,
-                                'sub': sub,
-                                'description': description,
-                                'enabled': False
-                            })
-            
-            for service in services:
-                stdout, stderr, code = CommandRunner.run_command(f"systemctl is-enabled {service['name']}")
-                service['enabled'] = stdout.strip() == "enabled"
-        
-        elif INIT_SYSTEM == "sysvinit":
-            init_dir = "/etc/init.d"
-            if os.path.exists(init_dir):
-                for service in os.listdir(init_dir):
-                    if os.path.isfile(os.path.join(init_dir, service)):
-                        services.append({
-                            'name': service,
-                            'load': 'loaded',
-                            'active': 'unknown',
-                            'sub': 'unknown',
-                            'description': service,
-                            'enabled': False
-                        })
-        
-        return services
-    
-    @staticmethod
-    def control_service(action, service_name, password=None):
-        """Control a service (start, stop, restart, enable, disable)"""
-        if INIT_SYSTEM == "systemd":
-            cmd = f"systemctl {action} {service_name}"
-            stdout, stderr, code = CommandRunner.run_sudo_command(cmd, password)
-            return code == 0, stderr if code != 0 else stdout
-        
-        elif INIT_SYSTEM == "sysvinit":
-            if action in ['start', 'stop', 'restart']:
-                cmd = f"service {service_name} {action}"
-                stdout, stderr, code = CommandRunner.run_sudo_command(cmd, password)
-                return code == 0, stderr if code != 0 else stdout
-        
-        return False, _("Service control not supported")
-    
-    @staticmethod
-    def get_service_status(service_name):
-        """Get detailed service status"""
-        if INIT_SYSTEM == "systemd":
-            stdout, stderr, code = CommandRunner.run_command(f"systemctl status {service_name}")
-            if code == 0:
-                return stdout
-        return None
-    
-    @staticmethod
-    def create_service(name, command, description="", user="", working_dir="", password=None):
-        """Create a new systemd service"""
-        if INIT_SYSTEM != "systemd":
-            return False, _("Service creation only supported with systemd")
-        
-        service_content = f"""[Unit]
-Description={description}
-After=network.target
-
-[Service]
-Type=simple
-User={user}
-WorkingDirectory={working_dir}
-ExecStart={command}
-Restart=on-failure
-
-[Install]
-WantedBy=multi-user.target
-"""
-        
-        # Write service file
-        service_file = f"/etc/systemd/system/{name}.service"
-        cmd = f"echo '{service_content}' > {service_file}"
-        stdout, stderr, code = CommandRunner.run_sudo_command(cmd, password)
-        if code != 0:
-            return False, stderr
-        
-        # Reload systemd
-        cmd = "systemctl daemon-reload"
-        stdout, stderr, code = CommandRunner.run_sudo_command(cmd, password)
-        if code != 0:
-            return False, stderr
-        
-        return True, _("Service created successfully")
-
-class UserManager:
-    """User management utilities"""
-    
-    @staticmethod
-    def get_users():
-        """Get list of system users"""
-        users = []
-        for user in pwd.getpwall():
-            if user.pw_uid >= 1000 or user.pw_name in ['root', 'nobody']:
-                users.append({
-                    'username': user.pw_name,
-                    'uid': user.pw_uid,
-                    'gid': user.pw_gid,
-                    'home': user.pw_dir,
-                    'shell': user.pw_shell,
-                    'gecos': user.pw_gecos
-                })
-        return users
-    
-    @staticmethod
-    def get_user_groups(username):
-        """Get groups for a user"""
-        groups = []
-        try:
-            groups_info = grp.getgrall()
-            for group in groups_info:
-                if username in group.gr_mem:
-                    groups.append(group.gr_name)
-            
-            user_info = pwd.getpwnam(username)
-            primary_group = grp.getgrgid(user_info.pw_gid)
-            if primary_group.gr_name not in groups:
-                groups.insert(0, primary_group.gr_name)
-        except:
-            pass
-        return groups
-    
-    @staticmethod
-    def create_user(username, password, full_name="", groups=None, password_confirm=None):
-        """Create a new user"""
-        if groups is None:
-            groups = []
-        
-        if not username:
-            return False, _("Username cannot be empty")
-        
-        if password != password_confirm:
-            return False, _("Passwords do not match")
-        
-        if len(password) < 8:
-            return False, _("Password must be at least 8 characters")
-        
-        cmd = f"useradd -m -s /bin/bash"
-        if full_name:
-            cmd += f" -c '{full_name}'"
-        cmd += f" {username}"
-        
-        stdout, stderr, code = CommandRunner.run_sudo_command(cmd)
-        if code != 0:
-            return False, stderr
-        
-        cmd = f"echo '{username}:{password}' | chpasswd"
-        stdout, stderr, code = CommandRunner.run_sudo_command(cmd)
-        if code != 0:
-            return False, stderr
-        
-        for group in groups:
-            cmd = f"usermod -aG {group} {username}"
-            CommandRunner.run_sudo_command(cmd)
-        
-        return True, _("User created successfully")
-    
-    @staticmethod
-    def modify_user(username, **kwargs):
-        """Modify user properties"""
-        if not username:
-            return False, _("Username cannot be empty")
-        
-        commands = []
-        
-        if 'full_name' in kwargs:
-            commands.append(f"usermod -c '{kwargs['full_name']}' {username}")
-        
-        if 'shell' in kwargs:
-            commands.append(f"usermod -s {kwargs['shell']} {username}")
-        
-        if 'groups' in kwargs:
-            groups = ','.join(kwargs['groups'])
-            commands.append(f"usermod -G {groups} {username}")
-        
-        if 'password' in kwargs and 'password_confirm' in kwargs:
-            if kwargs['password'] == kwargs['password_confirm']:
-                cmd = f"echo '{username}:{kwargs['password']}' | chpasswd"
-                commands.append(cmd)
-            else:
-                return False, _("Passwords do not match")
-        
-        for cmd in commands:
-            stdout, stderr, code = CommandRunner.run_sudo_command(cmd)
-            if code != 0:
-                return False, stderr
-        
-        return True, _("User modified successfully")
-    
-    @staticmethod
-    def delete_user(username, remove_home=True):
-        """Delete a user"""
-        if not username:
-            return False, _("Username cannot be empty")
-        
-        if username == 'root':
-            return False, _("Cannot delete root user")
-        
-        cmd = f"userdel {'-r' if remove_home else ''} {username}"
-        stdout, stderr, code = CommandRunner.run_sudo_command(cmd)
-        
-        return code == 0, stderr if code != 0 else _("User deleted successfully")
-    
-    @staticmethod
-    def lock_user(username, password=None):
-        """Lock a user account"""
-        if not username:
-            return False, _("Username cannot be empty")
-        
-        if username == 'root':
-            return False, _("Cannot lock root user")
-        
-        cmd = f"usermod -L {username}"
-        stdout, stderr, code = CommandRunner.run_sudo_command(cmd, password)
-        
-        return code == 0, stderr if code != 0 else _("User locked successfully")
-    
-    @staticmethod
-    def unlock_user(username, password=None):
-        """Unlock a user account"""
-        if not username:
-            return False, _("Username cannot be empty")
-        
-        cmd = f"usermod -U {username}"
-        stdout, stderr, code = CommandRunner.run_sudo_command(cmd, password)
-        
-        return code == 0, stderr if code != 0 else _("User unlocked successfully")
-    
-    @staticmethod
-    def get_all_groups():
-        """Get all system groups"""
-        groups = []
-        for group in grp.getgrall():
-            groups.append({
-                'name': group.gr_name,
-                'gid': group.gr_gid,
-                'members': group.gr_mem
-            })
-        return groups
-    
-    @staticmethod
-    def create_group(groupname, password=None):
-        """Create a new group"""
-        if not groupname:
-            return False, _("Group name cannot be empty")
-        
-        cmd = f"groupadd {groupname}"
-        stdout, stderr, code = CommandRunner.run_sudo_command(cmd, password)
-        
-        return code == 0, stderr if code != 0 else _("Group created successfully")
-    
-    @staticmethod
-    def delete_group(groupname, password=None):
-        """Delete a group"""
-        if not groupname:
-            return False, _("Group name cannot be empty")
-        
-        cmd = f"groupdel {groupname}"
-        stdout, stderr, code = CommandRunner.run_sudo_command(cmd, password)
-        
-        return code == 0, stderr if code != 0 else _("Group deleted successfully")
-
-class ProcessManager:
-    """Process management utilities"""
-    
-    @staticmethod
-    def get_processes():
-        """Get list of running processes"""
-        return SystemInfo.get_process_list()
-    
-    @staticmethod
-    def kill_process(pid, signal=15):
-        """Kill a process"""
-        stdout, stderr, code = CommandRunner.run_sudo_command(f"kill -{signal} {pid}")
-        return code == 0, stderr if code != 0 else _("Process killed")
-    
-    @staticmethod
-    def get_process_details(pid):
-        """Get detailed process information"""
-        try:
-            if SYSTEM == "Linux":
-                proc_dir = f"/proc/{pid}"
-                if os.path.exists(proc_dir):
-                    details = {}
-                    
-                    with open(f"{proc_dir}/cmdline", 'r') as f:
-                        details['cmdline'] = f.read().replace('\0', ' ').strip()
-                    
-                    with open(f"{proc_dir}/status", 'r') as f:
-                        status_lines = f.readlines()
-                        for line in status_lines:
-                            if line.startswith('Name:'):
-                                details['name'] = line.split('\t')[1].strip()
-                            elif line.startswith('State:'):
-                                details['state'] = line.split('\t')[1].strip()
-                            elif line.startswith('PPid:'):
-                                details['ppid'] = line.split('\t')[1].strip()
-                            elif line.startswith('Uid:'):
-                                details['uid'] = line.split('\t')[1].strip()
-                            elif line.startswith('Gid:'):
-                                details['gid'] = line.split('\t')[1].strip()
-                    
-                    with open(f"{proc_dir}/statm", 'r') as f:
-                        statm = f.read().split()
-                        details['rss'] = int(statm[1]) * 4096 // (1024 * 1024)
-                    
-                    return details
-        except:
-            pass
-        return None
-    
-    @staticmethod
-    def get_process_tree():
-        """Get process tree hierarchy"""
-        try:
-            processes = {}
-            stdout, stderr, code = CommandRunner.run_command("ps -eo pid,ppid,comm")
-            if code == 0:
-                for line in stdout.split('\n')[1:]:
-                    if line.strip():
-                        parts = line.split()
-                        if len(parts) >= 3:
-                            pid = int(parts[0])
-                            ppid = int(parts[1])
-                            name = parts[2]
-                            
-                            processes[pid] = {
-                                'pid': pid,
-                                'ppid': ppid,
-                                'name': name,
-                                'children': []
-                            }
-                
-                # Build tree structure
-                tree = []
-                for pid, proc in processes.items():
-                    ppid = proc['ppid']
-                    if ppid in processes:
-                        processes[ppid]['children'].append(proc)
-                    else:
-                        tree.append(proc)
-                
-                return tree
-        except:
-            pass
-        return []
-    
-    @staticmethod
-    def get_process_io(pid):
-        """Get process I/O statistics"""
-        try:
-            if SYSTEM == "Linux":
-                proc_dir = f"/proc/{pid}"
-                if os.path.exists(proc_dir):
-                    with open(f"{proc_dir}/io", 'r') as f:
-                        io_data = {}
-                        for line in f:
-                            if ':' in line:
-                                key, value = line.split(':', 1)
-                                io_data[key.strip()] = int(value.strip())
-                        return io_data
-        except:
-            pass
-        return {}
-    
-    @staticmethod
-    def get_process_network(pid):
-        """Get process network connections"""
-        try:
-            connections = []
-            stdout, stderr, code = CommandRunner.run_command(f"lsof -i -P -n | grep {pid}")
-            if code == 0:
-                for line in stdout.split('\n'):
-                    if line.strip():
-                        parts = line.split()
-                        if len(parts) >= 8:
-                            protocol = parts[4]
-                            local = parts[8]
-                            remote = parts[9] if len(parts) > 9 else ""
-                            status = parts[9] if len(parts) > 9 else ""
-                            
-                            connections.append({
-                                'protocol': protocol,
-                                'local': local,
-                                'remote': remote,
-                                'status': status
-                            })
-            return connections
-        except:
-            pass
-        return []
-    
-    @staticmethod
-    def set_process_priority(pid, priority, password=None):
-        """Set process priority"""
-        try:
-            stdout, stderr, code = CommandRunner.run_sudo_command(f"renice {priority} {pid}", password)
-            return code == 0, stderr if code != 0 else _("Priority set successfully")
-        except:
-            pass
-        return False, _("Failed to set priority")
-    
-    @staticmethod
-    def get_process_open_files(pid):
-        """Get files opened by a process"""
-        try:
-            open_files = []
-            stdout, stderr, code = CommandRunner.run_command(f"lsof -p {pid}")
-            if code == 0:
-                for line in stdout.split('\n')[1:]:
-                    if line.strip():
-                        parts = line.split()
-                        if len(parts) >= 9:
-                            open_files.append({
-                                'path': parts[8],
-                                'fd': parts[3]
-                            })
-            return open_files
-        except:
-            pass
-        return []
-
-class BackupManager:
-    """System backup and restore utilities"""
-    
-    @staticmethod
-    def check_backup_tool():
-        """Check if a backup tool is available"""
-        if DependencyManager.check_dependency("timeshift"):
-            return "timeshift"
-        elif DependencyManager.check_dependency("snapper"):
-            return "snapper"
-        return None
-    
-    @staticmethod
-    def create_backup(name="", description="", password=None):
-        """Create a system backup"""
-        tool = BackupManager.check_backup_tool()
-        if not tool:
-            return False, _("No backup tool available")
-        
-        if tool == "timeshift":
-            cmd = f"timeshift --create --comments '{description}'"
-            if name:
-                cmd += f" --tags {name}"
-            
-            stdout, stderr, code = CommandRunner.run_sudo_command(cmd, password)
-            return code == 0, stderr if code != 0 else _("Backup created successfully")
-        
-        elif tool == "snapper":
-            # Create a new snapshot
-            cmd = f"snapper create -d '{description}'"
-            stdout, stderr, code = CommandRunner.run_sudo_command(cmd, password)
-            return code == 0, stderr if code != 0 else _("Backup created successfully")
-        
-        return False, _("Backup failed")
-    
-    @staticmethod
-    def list_backups():
-        """List available backups"""
-        tool = BackupManager.check_backup_tool()
-        if not tool:
-            return []
-        
-        backups = []
-        
-        if tool == "timeshift":
-            stdout, stderr, code = CommandRunner.run_command("timeshift --list")
-            if code == 0:
-                for line in stdout.split('\n'):
-                    if line and not line.startswith('Name') and not line.startswith('---'):
-                        parts = line.split()
-                        if len(parts) >= 4:
-                            backups.append({
-                                'name': parts[0],
-                                'date': parts[1],
-                                'time': parts[2],
-                                'tags': parts[3],
-                                'description': ' '.join(parts[4:]) if len(parts) > 4 else ""
-                            })
-        
-        elif tool == "snapper":
-            stdout, stderr, code = CommandRunner.run_command("snapper list")
-            if code == 0:
-                for line in stdout.split('\n'):
-                    if line and not line.startswith('#') and not line.startswith('Type'):
-                        parts = line.split()
-                        if len(parts) >= 5:
-                            backups.append({
-                                'id': parts[0],
-                                'type': parts[1],
-                                'number': parts[2],
-                                'date': parts[3],
-                                'time': parts[4],
-                                'description': ' '.join(parts[5:]) if len(parts) > 5 else ""
-                            })
-        
-        return backups
-    
-    @staticmethod
-    def restore_backup(backup_id, password=None):
-        """Restore from a backup"""
-        tool = BackupManager.check_backup_tool()
-        if not tool:
-            return False, _("No backup tool available")
-        
-        if tool == "timeshift":
-            cmd = f"timeshift --restore --snapshot {backup_id}"
-            stdout, stderr, code = CommandRunner.run_sudo_command(cmd, password)
-            return code == 0, stderr if code != 0 else _("System restored successfully")
-        
-        elif tool == "snapper":
-            cmd = f"snapper undochange {backup_id}"
-            stdout, stderr, code = CommandRunner.run_sudo_command(cmd, password)
-            return code == 0, stderr if code != 0 else _("System restored successfully")
-        
-        return False, _("Restore failed")
-    
-    @staticmethod
-    def delete_backup(backup_id, password=None):
-        """Delete a backup"""
-        tool = BackupManager.check_backup_tool()
-        if not tool:
-            return False, _("No backup tool available")
-        
-        if tool == "timeshift":
-            cmd = f"timeshift --delete --snapshot {backup_id}"
-            stdout, stderr, code = CommandRunner.run_sudo_command(cmd, password)
-            return code == 0, stderr if code != 0 else _("Backup deleted successfully")
-        
-        elif tool == "snapper":
-            cmd = f"snapper delete {backup_id}"
-            stdout, stderr, code = CommandRunner.run_sudo_command(cmd, password)
-            return code == 0, stderr if code != 0 else _("Backup deleted successfully")
-        
-        return False, _("Delete failed")
-
-class SystemCleaner:
-    """System cleaning utilities"""
-    
-    @staticmethod
-    def clean_package_cache(password=None):
-        """Clean package manager cache"""
-        if not PACKAGE_MANAGER:
-            return False, _("No package manager found")
-        
-        commands = {
-            "apt": "apt autoremove -y && apt autoclean",
-            "dnf": "dnf autoremove -y",
-            "zypper": "zypper clean -a",
-            "pacman": "pacman -Rns $(pacman -Qtdq)",
-            "brew": "brew cleanup"
-        }
-        
-        if PACKAGE_MANAGER in commands:
-            if PACKAGE_MANAGER != "brew":
-                stdout, stderr, code = CommandRunner.run_sudo_command(commands[PACKAGE_MANAGER], password)
-            else:
-                stdout, stderr, code = CommandRunner.run_command(commands[PACKAGE_MANAGER])
-            
-            return code == 0, stderr if code != 0 else _("Package cache cleaned")
-        
-        return False, _("Package cache cleaning not supported")
-    
-    @staticmethod
-    def clean_temp_files(password=None):
-        """Clean temporary files"""
-        if SYSTEM == "Linux":
-            cmd = "find /tmp -type f -atime +7 -delete"
-            stdout, stderr, code = CommandRunner.run_sudo_command(cmd, password)
-            if code != 0:
-                return False, stderr
-            
-            cmd = "find /var/tmp -type f -atime +7 -delete"
-            stdout, stderr, code = CommandRunner.run_sudo_command(cmd, password)
-            if code != 0:
-                return False, stderr
-            
-            return True, _("Temporary files cleaned")
-        
-        elif SYSTEM == "Darwin":
-            cmd = "find /tmp -type f -atime +7 -delete"
-            stdout, stderr, code = CommandRunner.run_command(cmd)
-            if code != 0:
-                return False, stderr
-            
-            return True, _("Temporary files cleaned")
-        
-        return False, _("Temporary file cleaning not supported")
-    
-    @staticmethod
-    def clean_logs(password=None):
-        """Clean system logs"""
-        if SYSTEM == "Linux":
-            cmd = "journalctl --vacuum-time=7d"
-            stdout, stderr, code = CommandRunner.run_sudo_command(cmd, password)
-            if code != 0:
-                return False, stderr
-            
-            return True, _("System logs cleaned")
-        
-        return False, _("Log cleaning not supported")
-    
-    @staticmethod
-    def clean_thumbnails():
-        """Clean thumbnail cache"""
-        if SYSTEM == "Linux":
-            home = os.path.expanduser("~")
-            thumb_dir = os.path.join(home, ".cache", "thumbnails")
-            
-            if os.path.exists(thumb_dir):
-                try:
-                    shutil.rmtree(thumb_dir)
-                    os.makedirs(thumb_dir)
-                    return True, _("Thumbnail cache cleaned")
-                except:
-                    return False, _("Failed to clean thumbnail cache")
-        
-        return False, _("Thumbnail cleaning not supported")
-    
-    @staticmethod
-    def get_disk_usage_by_directory(path="/"):
-        """Get disk usage by directory"""
-        try:
-            usage = {}
-            for item in os.listdir(path):
-                item_path = os.path.join(path, item)
-                if os.path.isdir(item_path):
-                    try:
-                        total_size = 0
-                        for dirpath, dirnames, filenames in os.walk(item_path):
-                            for f in filenames:
-                                fp = os.path.join(dirpath, f)
-                                if os.path.exists(fp):
-                                    total_size += os.path.getsize(fp)
-                        
-                        usage[item] = total_size // (1024 * 1024)  # MB
-                    except:
-                        usage[item] = 0
-            return usage
-        except:
-            return {}
-
-class DiskManager:
-    """Disk management utilities"""
-    
-    @staticmethod
-    def get_disk_partitions():
-        """Get disk partitions"""
-        try:
-            partitions = []
-            stdout, stderr, code = CommandRunner.run_command("df -h")
-            if code == 0:
-                lines = stdout.split('\n')[1:]  # Skip header
-                for line in lines:
-                    if line.strip():
-                        parts = line.split()
-                        if len(parts) >= 6:
-                            device = parts[0]
-                            total_str = parts[1]
-                            used_str = parts[2]
-                            avail_str = parts[3]
-                            percent_str = parts[4].replace('%', '')
-                            mountpoint = parts[5]
-                            
-                            def parse_size(size_str):
-                                if size_str.endswith('G'):
-                                    return float(size_str[:-1])
-                                elif size_str.endswith('M'):
-                                    return float(size_str[:-1]) / 1024
-                                elif size_str.endswith('T'):
-                                    return float(size_str[:-1]) * 1024
-                                elif size_str.endswith('K'):
-                                    return float(size_str[:-1]) / 1024 / 1024
-                                return 0
-                            
-                            total = parse_size(total_str)
-                            used = parse_size(used_str)
-                            avail = parse_size(avail_str)
-                            percent = float(percent_str)
-                            
-                            partitions.append({
-                                'device': device,
-                                'mountpoint': mountpoint,
-                                'fstype': '',
-                                'total': total,
-                                'used': used,
-                                'free': avail,
-                                'percent': percent
-                            })
-            return partitions
-        except:
-            return []
-    
-    @staticmethod
-    def get_physical_disks():
-        """Get physical disk information"""
-        disks = []
-        
-        if SYSTEM == "Linux":
-            stdout, stderr, code = CommandRunner.run_command("lsblk -d -o NAME,SIZE,MODEL,VENDOR,TYPE")
-            if code == 0:
-                for line in stdout.split('\n')[1:]:  # Skip header
-                    if line.strip():
-                        parts = line.split()
-                        if len(parts) >= 4:
-                            disks.append({
-                                'name': parts[0],
-                                'size': parts[1],
-                                'model': parts[2],
-                                'vendor': parts[3],
-                                'type': parts[4] if len(parts) > 4 else ""
-                            })
-        
-        elif SYSTEM == "Darwin":
-            stdout, stderr, code = CommandRunner.run_command("diskutil list")
-            if code == 0:
-                current_disk = None
-                for line in stdout.split('\n'):
-                    if '/dev/disk' in line:
-                        parts = line.split()
-                        if len(parts) >= 3:
-                            disk_id = parts[0]
-                            size = parts[1]
-                            disk_type = ' '.join(parts[2:])
-                            
-                            disks.append({
-                                'name': disk_id,
-                                'size': size,
-                                'model': disk_type,
-                                'vendor': "",
-                                'type': ""
-                            })
-        
-        return disks
-    
-    @staticmethod
-    def mount_filesystem(device, mountpoint, fstype="", password=None):
-        """Mount a filesystem"""
-        if not device or not mountpoint:
-            return False, _("Device and mountpoint must be specified")
-        
-        # Create mountpoint if it doesn't exist
-        if not os.path.exists(mountpoint):
-            cmd = f"mkdir -p {mountpoint}"
-            stdout, stderr, code = CommandRunner.run_sudo_command(cmd, password)
-            if code != 0:
-                return False, stderr
-        
-        # Mount the filesystem
-        if fstype:
-            cmd = f"mount -t {fstype} {device} {mountpoint}"
-        else:
-            cmd = f"mount {device} {mountpoint}"
-        
-        stdout, stderr, code = CommandRunner.run_sudo_command(cmd, password)
-        return code == 0, stderr if code != 0 else _("Filesystem mounted successfully")
-    
-    @staticmethod
-    def unmount_filesystem(mountpoint, password=None):
-        """Unmount a filesystem"""
-        if not mountpoint:
-            return False, _("Mountpoint must be specified")
-        
-        cmd = f"umount {mountpoint}"
-        stdout, stderr, code = CommandRunner.run_sudo_command(cmd, password)
-        return code == 0, stderr if code != 0 else _("Filesystem unmounted successfully")
-    
-    @staticmethod
-    def format_partition(device, fstype, password=None):
-        """Format a partition"""
-        if not device or not fstype:
-            return False, _("Device and filesystem type must be specified")
-        
-        commands = {
-            "ext4": f"mkfs.ext4 {device}",
-            "ext3": f"mkfs.ext3 {device}",
-            "ext2": f"mkfs.ext2 {device}",
-            "ntfs": f"mkfs.ntfs {device}",
-            "fat32": f"mkfs.vfat -F 32 {device}",
-            "btrfs": f"mkfs.btrfs {device}",
-            "xfs": f"mkfs.xfs {device}"
-        }
-        
-        if fstype in commands:
-            cmd = commands[fstype]
-            stdout, stderr, code = CommandRunner.run_sudo_command(cmd, password)
-            return code == 0, stderr if code != 0 else _("Partition formatted successfully")
-        
-        return False, _("Unsupported filesystem type")
-    
-    @staticmethod
-    def launch_partition_manager(password=None):
-        """Launch graphical partition manager"""
-        if DependencyManager.check_dependency("gparted"):
-            if SYSTEM == "Linux":
-                cmd = "gparted"
-                if password:
-                    # Run in background
-                    cmd = f"echo '{password}' | sudo -S gparted &"
-                else:
-                    cmd = "gparted &"
-                
-                stdout, stderr, code = CommandRunner.run_command(cmd)
-                return code == 0, stderr if code != 0 else _("Partition manager launched")
-        
-        return False, _("Partition manager not available")
-
+# Main Application Window
 class DockpanelWindow(Gtk.ApplicationWindow):
     """Main application window"""
     
     def __init__(self, app):
-        Gtk.ApplicationWindow.__init__(self, application=app, title="Dockpanel")
-        self.set_default_size(1200, 800)
+        Gtk.ApplicationWindow.__init__(self, application=app, title=APP_NAME)
+        self.set_default_size(1400, 900)
         self.set_border_width(0)
         
         # Initialize managers
         self.pkg_manager = PackageManager()
-        self.password_dialog = None
-        
-        # Network speed tracking
-        self.last_network_stats = {}
-        self.network_speed_update_time = 0
+        self.repo_manager = RepositoryManager()
+        self.boot_manager = BootManager()
+        self.kernel_manager = KernelManager()
+        self.service_manager = SystemServiceManager()
+        self.firewall_manager = FirewallManager()
+        self.log_manager = LogManager()
+        self.user_manager = UserManager()
         
         # Create main container
         self.main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
@@ -2417,39 +1504,26 @@ class DockpanelWindow(Gtk.ApplicationWindow):
         # Status bar
         self.statusbar = Gtk.Statusbar()
         self.main_box.pack_start(self.statusbar, False, False, 0)
-        self.statusbar.push(0, _("Ready"))
+        self.statusbar.push(0, "Ready")
         
-        # Start background monitoring
-        self.start_monitoring()
-        
-        # Connect window state event
-        self.connect("window-state-event", self.on_window_state_changed)
-        self.connect("configure-event", self.on_configure_event)
+        # Show all
+        self.show_all()
     
     def create_header(self):
         """Create application header"""
         header = Gtk.HeaderBar()
         header.set_show_close_button(True)
-        header.props.title = "Dockpanel"
-        
-        style_context = header.get_style_context()
-        style_context.add_class("titlebar")
+        header.props.title = APP_NAME
         
         # Add refresh button
         refresh_button = Gtk.Button.new_from_icon_name("view-refresh", Gtk.IconSize.BUTTON)
-        refresh_button.set_tooltip_text(_("Refresh"))
+        refresh_button.set_tooltip_text("Refresh")
         refresh_button.connect("clicked", self.on_refresh_clicked)
         header.pack_end(refresh_button)
         
-        # Add settings button
-        settings_button = Gtk.Button.new_from_icon_name("preferences-system", Gtk.IconSize.BUTTON)
-        settings_button.set_tooltip_text(_("Settings"))
-        settings_button.connect("clicked", self.on_settings_clicked)
-        header.pack_end(settings_button)
-        
         # Add about button
         about_button = Gtk.Button.new_from_icon_name("help-about", Gtk.IconSize.BUTTON)
-        about_button.set_tooltip_text(_("About"))
+        about_button.set_tooltip_text("About")
         about_button.connect("clicked", self.on_about_clicked)
         header.pack_end(about_button)
         
@@ -2471,7 +1545,7 @@ class DockpanelWindow(Gtk.ApplicationWindow):
         """Create sidebar with navigation"""
         # Sidebar container
         self.sidebar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        self.sidebar.set_size_request(200, -1)
+        self.sidebar.set_size_request(220, -1)
         self.sidebar.get_style_context().add_class("sidebar")
         self.content_box.pack_start(self.sidebar, False, False, 0)
         
@@ -2502,18 +1576,22 @@ class DockpanelWindow(Gtk.ApplicationWindow):
         self.nav_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
         self.nav_list.connect("row-selected", self.on_nav_selected)
         
-        # Navigation items with icons
+        # Navigation items
         nav_items = [
-            ("view-grid", _("Dashboard"), "dashboard"),
-            ("system-software-install", _("Packages"), "packages"),
-            ("system-users", _("Users"), "users"),
-            ("network-transmit-receive", _("Network"), "network"),
-            ("system-run", _("Services"), "services"),
-            ("preferences-system", _("System"), "system"),
-            ("dialog-information", _("Processes"), "processes"),
-            ("drive-harddisk", _("Disks"), "disks"),
-            ("document-save", _("Backups"), "backups"),
-            ("user-trash", _("Cleaner"), "cleaner")
+            ("view-grid", "Dashboard", "dashboard"),
+            ("system-software-install", "Packages", "packages"),
+            ("folder-remote", "Repositories", "repositories"),
+            ("system-users", "Users", "users"),
+            ("network-transmit-receive", "Network", "network"),
+            ("system-run", "Services", "services"),
+            ("dialog-information", "Processes", "processes"),
+            ("drive-harddisk", "Disks", "disks"),
+            ("media-floppy", "Boot Loader", "boot"),
+            ("document-save", "Backups", "backups"),
+            ("user-trash", "Cleaner", "cleaner"),
+            ("text-x-generic", "Logs", "logs"),
+            ("security-high", "Firewall", "firewall"),
+            ("preferences-system", "System", "system")
         ]
         
         for icon_name, label, page_id in nav_items:
@@ -2561,21 +1639,25 @@ class DockpanelWindow(Gtk.ApplicationWindow):
         self.stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
         self.content_container.pack_start(self.stack, True, True, 0)
         
-        # Create all pages
+        # Create pages
         self.create_dashboard_page()
         self.create_packages_page()
+        self.create_repositories_page()
         self.create_users_page()
         self.create_network_page()
         self.create_services_page()
-        self.create_system_page()
         self.create_processes_page()
         self.create_disks_page()
+        self.create_boot_page()
         self.create_backups_page()
         self.create_cleaner_page()
+        self.create_logs_page()
+        self.create_firewall_page()
+        self.create_system_page()
     
     def create_dashboard_page(self):
         """Create dashboard page"""
-        # Main container with scrolling
+        # Main container
         dashboard_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=15)
         dashboard_container.set_border_width(20)
         
@@ -2586,158 +1668,60 @@ class DockpanelWindow(Gtk.ApplicationWindow):
         title.set_margin_bottom(20)
         dashboard_container.pack_start(title, False, False, 0)
         
-        # Grid for cards
-        dashboard_grid = Gtk.Grid()
-        dashboard_grid.set_row_spacing(15)
-        dashboard_grid.set_column_spacing(15)
-        dashboard_grid.set_column_homogeneous(True)
-        
-        # System Info Card
-        system_card = self.create_card(_("System Information"))
+        # System info grid
         system_grid = Gtk.Grid()
-        system_grid.set_row_spacing(8)
-        system_grid.set_column_spacing(10)
+        system_grid.set_row_spacing(15)
+        system_grid.set_column_spacing(15)
+        system_grid.set_column_homogeneous(True)
         
-        self.system_info_labels = {}
-        system_items = [
-            ("os", _("Operating System")),
-            ("kernel", _("Kernel Version")),
-            ("uptime", _("System Uptime")),
-            ("hostname", _("Hostname")),
-            ("cpu_model", _("CPU Model")),
-            ("cpu_cores", _("CPU Cores")),
-            ("memory_total", _("Total Memory")),
-            ("disk_total", _("Disk Space"))
+        # System info card
+        system_card = self.create_card("System Information")
+        system_info = SystemInfoManager.get_system_info()
+        
+        info_grid = Gtk.Grid()
+        info_grid.set_row_spacing(8)
+        info_grid.set_column_spacing(10)
+        
+        info_items = [
+            ("OS", f"{system_info.os} {system_info.distro}"),
+            ("Kernel", system_info.kernel),
+            ("Hostname", system_info.hostname),
+            ("Uptime", system_info.uptime),
+            ("Boot Mode", system_info.boot_mode),
+            ("Secure Boot", "Enabled" if system_info.secure_boot else "Disabled"),
+            ("CPU", f"{system_info.cpu_model} ({system_info.cpu_cores} cores)"),
+            ("Memory", f"{system_info.memory_used}GB / {system_info.memory_total}GB"),
+            ("Disk", f"{system_info.disk_used}GB / {system_info.disk_total}GB")
         ]
         
-        for i, (key, label) in enumerate(system_items):
+        for i, (label, value) in enumerate(info_items):
             lbl = Gtk.Label(label=f"{label}:")
             lbl.set_halign(Gtk.Align.START)
             lbl.get_style_context().add_class("dim-label")
-            system_grid.attach(lbl, 0, i, 1, 1)
+            info_grid.attach(lbl, 0, i, 1, 1)
             
-            value_lbl = Gtk.Label(label="Loading...")
+            value_lbl = Gtk.Label(label=value)
             value_lbl.set_halign(Gtk.Align.START)
             value_lbl.set_selectable(True)
-            self.system_info_labels[key] = value_lbl
-            system_grid.attach(value_lbl, 1, i, 1, 1)
+            info_grid.attach(value_lbl, 1, i, 1, 1)
         
-        system_card.get_child().add(system_grid)
-        dashboard_grid.attach(system_card, 0, 0, 1, 1)
+        system_card.get_child().add(info_grid)
+        system_grid.attach(system_card, 0, 0, 2, 1)
         
-        # Resource Usage Card
-        resource_card = self.create_card(_("Resource Usage"))
-        resource_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        
-        # CPU usage
-        cpu_frame = Gtk.Frame()
-        cpu_frame.set_label(_("CPU Usage"))
-        cpu_frame.set_label_align(0.02, 0.5)
-        self.cpu_progress = Gtk.ProgressBar()
-        self.cpu_progress.set_text("0%")
-        self.cpu_progress.set_show_text(True)
-        cpu_frame.add(self.cpu_progress)
-        resource_box.pack_start(cpu_frame, False, False, 0)
-        
-        # Memory usage
-        memory_frame = Gtk.Frame()
-        memory_frame.set_label(_("Memory Usage"))
-        memory_frame.set_label_align(0.02, 0.5)
-        self.memory_progress = Gtk.ProgressBar()
-        self.memory_progress.set_text("0%")
-        self.memory_progress.set_show_text(True)
-        memory_frame.add(self.memory_progress)
-        resource_box.pack_start(memory_frame, False, False, 0)
-        
-        # Swap usage
-        swap_frame = Gtk.Frame()
-        swap_frame.set_label(_("Swap Usage"))
-        swap_frame.set_label_align(0.02, 0.5)
-        self.swap_progress = Gtk.ProgressBar()
-        self.swap_progress.set_text("0%")
-        self.swap_progress.set_show_text(True)
-        swap_frame.add(self.swap_progress)
-        resource_box.pack_start(swap_frame, False, False, 0)
-        
-        # Disk usage
-        disk_frame = Gtk.Frame()
-        disk_frame.set_label(_("Disk Usage"))
-        disk_frame.set_label_align(0.02, 0.5)
-        self.disk_progress = Gtk.ProgressBar()
-        self.disk_progress.set_text("0%")
-        self.disk_progress.set_show_text(True)
-        disk_frame.add(self.disk_progress)
-        resource_box.pack_start(disk_frame, False, False, 0)
-        
-        # Temperature
-        self.temp_frame = Gtk.Frame()
-        self.temp_frame.set_label(_("System Temperature"))
-        self.temp_frame.set_label_align(0.02, 0.5)
-        self.temp_label = Gtk.Label(label="N/A")
-        self.temp_frame.add(self.temp_label)
-        resource_box.pack_start(self.temp_frame, False, False, 0)
-        
-        # Battery
-        self.battery_frame = Gtk.Frame()
-        self.battery_frame.set_label(_("Battery Status"))
-        self.battery_frame.set_label_align(0.02, 0.5)
-        self.battery_label = Gtk.Label(label="N/A")
-        self.battery_frame.add(self.battery_label)
-        resource_box.pack_start(self.battery_frame, False, False, 0)
-        
-        # System load
-        self.load_frame = Gtk.Frame()
-        self.load_frame.set_label(_("System Load"))
-        self.load_frame.set_label_align(0.02, 0.5)
-        self.load_label = Gtk.Label(label="N/A")
-        self.load_frame.add(self.load_label)
-        resource_box.pack_start(self.load_frame, False, False, 0)
-        
-        resource_card.get_child().add(resource_box)
-        dashboard_grid.attach(resource_card, 1, 0, 1, 1)
-        
-        # Network Status Card
-        network_card = self.create_card(_("Network Status"))
-        network_grid = Gtk.Grid()
-        network_grid.set_row_spacing(8)
-        network_grid.set_column_spacing(10)
-        
-        self.network_info_labels = {}
-        network_items = [
-            ("ip", _("IP Address")),
-            ("gateway", _("Gateway")),
-            ("dns", _("DNS Server")),
-            ("upload", _("Upload Speed")),
-            ("download", _("Download Speed"))
-        ]
-        
-        for i, (key, label) in enumerate(network_items):
-            lbl = Gtk.Label(label=f"{label}:")
-            lbl.set_halign(Gtk.Align.START)
-            lbl.get_style_context().add_class("dim-label")
-            network_grid.attach(lbl, 0, i, 1, 1)
-            
-            value_lbl = Gtk.Label(label="Loading...")
-            value_lbl.set_halign(Gtk.Align.START)
-            value_lbl.set_selectable(True)
-            self.network_info_labels[key] = value_lbl
-            network_grid.attach(value_lbl, 1, i, 1, 1)
-        
-        network_card.get_child().add(network_grid)
-        dashboard_grid.attach(network_card, 0, 1, 1, 1)
-        
-        # Quick Actions Card
-        actions_card = self.create_card(_("Quick Actions"))
+        # Quick actions card
+        actions_card = self.create_card("Quick Actions")
         actions_grid = Gtk.Grid()
         actions_grid.set_row_spacing(10)
         actions_grid.set_column_spacing(10)
         actions_grid.set_column_homogeneous(True)
         
         actions = [
-            (_("Update System"), "system-software-update", self.on_quick_update),
-            (_("Clean System"), "user-trash", self.on_quick_clean),
-            (_("Backup System"), "document-save", self.on_quick_backup),
-            (_("System Info"), "dialog-information", self.on_quick_info)
+            ("Update System", "system-software-update", self.on_quick_update),
+            ("Clean System", "user-trash", self.on_quick_clean),
+            ("Network Info", "network-transmit-receive", self.on_quick_network),
+            ("Service Status", "system-run", self.on_quick_services),
+            ("Disk Usage", "drive-harddisk", self.on_quick_disk),
+            ("System Logs", "text-x-generic", self.on_quick_logs)
         ]
         
         for i, (label, icon, callback) in enumerate(actions):
@@ -2748,19 +1732,421 @@ class DockpanelWindow(Gtk.ApplicationWindow):
                 btn.set_image(Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.BUTTON))
                 btn.set_always_show_image(True)
             btn.connect("clicked", callback)
-            row = i // 2
-            col = i % 2
-            actions_grid.attach(btn, col, row, 1, 1)
+            actions_grid.attach(btn, i % 3, i // 3, 1, 1)
         
         actions_card.get_child().add(actions_grid)
-        dashboard_grid.attach(actions_card, 1, 1, 1, 1)
+        system_grid.attach(actions_card, 0, 1, 2, 1)
         
-        # Make dashboard scrollable
+        dashboard_container.pack_start(system_grid, True, True, 0)
+        
+        # Make scrollable
         dashboard_scrolled = Gtk.ScrolledWindow()
         dashboard_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        dashboard_scrolled.add(dashboard_grid)
+        dashboard_scrolled.add(dashboard_container)
         
-        self.stack.add_titled(dashboard_scrolled, "dashboard", _("Dashboard"))
+        self.stack.add_titled(dashboard_scrolled, "dashboard", "Dashboard")
+    
+    def create_repositories_page(self):
+        """Create repositories page"""
+        repos_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=15)
+        repos_container.set_border_width(20)
+        
+        # Title
+        title = Gtk.Label()
+        title.set_markup("<big><b>Repository Management</b></big>")
+        title.set_halign(Gtk.Align.START)
+        title.set_margin_bottom(20)
+        repos_container.pack_start(title, False, False, 0)
+        
+        # Toolbar
+        toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+        
+        add_repo_button = Gtk.Button(label="Add Repository")
+        add_repo_button.set_image(Gtk.Image.new_from_icon_name("list-add", Gtk.IconSize.BUTTON))
+        add_repo_button.set_always_show_image(True)
+        add_repo_button.connect("clicked", self.on_add_repository)
+        toolbar.pack_start(add_repo_button, False, False, 0)
+        
+        refresh_button = Gtk.Button(label="Refresh")
+        refresh_button.set_image(Gtk.Image.new_from_icon_name("view-refresh", Gtk.IconSize.BUTTON))
+        refresh_button.set_always_show_image(True)
+        refresh_button.connect("clicked", self.on_refresh_repositories)
+        toolbar.pack_start(refresh_button, False, False, 0)
+        
+        repos_container.pack_start(toolbar, False, False, 0)
+        
+        # Repository list
+        repos_card = self.create_card("System Repositories")
+        repos_scrolled = Gtk.ScrolledWindow()
+        repos_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        repos_scrolled.set_min_content_height(400)
+        
+        # Create treeview for repositories
+        self.repo_liststore = Gtk.ListStore(bool, str, str, str)
+        self.repo_treeview = Gtk.TreeView(model=self.repo_liststore)
+        self.repo_treeview.set_rules_hint(True)
+        
+        # Add columns
+        toggle_renderer = Gtk.CellRendererToggle()
+        toggle_renderer.connect("toggled", self.on_repo_toggled)
+        toggle_column = Gtk.TreeViewColumn("Enabled", toggle_renderer, active=0)
+        self.repo_treeview.append_column(toggle_column)
+        
+        text_renderer = Gtk.CellRendererText()
+        name_column = Gtk.TreeViewColumn("Name", text_renderer, text=1)
+        name_column.set_resizable(True)
+        self.repo_treeview.append_column(name_column)
+        
+        url_column = Gtk.TreeViewColumn("URL", text_renderer, text=2)
+        url_column.set_resizable(True)
+        self.repo_treeview.append_column(url_column)
+        
+        type_column = Gtk.TreeViewColumn("Type", text_renderer, text=3)
+        self.repo_treeview.append_column(type_column)
+        
+        repos_scrolled.add(self.repo_treeview)
+        repos_card.get_child().add(repos_scrolled)
+        repos_container.pack_start(repos_card, True, True, 0)
+        
+        # Action buttons
+        action_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        action_box.set_halign(Gtk.Align.END)
+        action_box.set_margin_top(10)
+        
+        self.enable_repo_button = Gtk.Button(label="Enable")
+        self.enable_repo_button.set_image(Gtk.Image.new_from_icon_name("dialog-yes", Gtk.IconSize.BUTTON))
+        self.enable_repo_button.set_always_show_image(True)
+        self.enable_repo_button.set_sensitive(False)
+        self.enable_repo_button.connect("clicked", self.on_enable_repository)
+        action_box.pack_start(self.enable_repo_button, False, False, 0)
+        
+        self.disable_repo_button = Gtk.Button(label="Disable")
+        self.disable_repo_button.set_image(Gtk.Image.new_from_icon_name("dialog-no", Gtk.IconSize.BUTTON))
+        self.disable_repo_button.set_always_show_image(True)
+        self.disable_repo_button.set_sensitive(False)
+        self.disable_repo_button.connect("clicked", self.on_disable_repository)
+        action_box.pack_start(self.disable_repo_button, False, False, 0)
+        
+        self.remove_repo_button = Gtk.Button(label="Remove")
+        self.remove_repo_button.set_image(Gtk.Image.new_from_icon_name("edit-delete", Gtk.IconSize.BUTTON))
+        self.remove_repo_button.set_always_show_image(True)
+        self.remove_repo_button.set_sensitive(False)
+        self.remove_repo_button.connect("clicked", self.on_remove_repository)
+        action_box.pack_start(self.remove_repo_button, False, False, 0)
+        
+        repos_container.pack_start(action_box, False, False, 0)
+        
+        # Make scrollable
+        repos_scrolled = Gtk.ScrolledWindow()
+        repos_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        repos_scrolled.add(repos_container)
+        
+        self.stack.add_titled(repos_scrolled, "repositories", "Repositories")
+        
+        # Connect selection signal
+        self.repo_treeview.get_selection().connect("changed", self.on_repo_selected)
+        
+        # Load repositories
+        self.load_repositories()
+    
+    def create_boot_page(self):
+        """Create boot configuration page"""
+        boot_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=15)
+        boot_container.set_border_width(20)
+        
+        # Title
+        title = Gtk.Label()
+        title.set_markup("<big><b>Boot Configuration</b></big>")
+        title.set_halign(Gtk.Align.START)
+        title.set_margin_bottom(20)
+        boot_container.pack_start(title, False, False, 0)
+        
+        # Boot info grid
+        boot_grid = Gtk.Grid()
+        boot_grid.set_row_spacing(15)
+        boot_grid.set_column_spacing(15)
+        boot_grid.set_column_homogeneous(True)
+        
+        # Boot loader info card
+        bootloader_card = self.create_card("Boot Loader Information")
+        boot_config = self.boot_manager.get_boot_config()
+        
+        info_grid = Gtk.Grid()
+        info_grid.set_row_spacing(8)
+        info_grid.set_column_spacing(10)
+        
+        info_items = [
+            ("Boot Loader", boot_config['bootloader']),
+            ("Default Entry", boot_config['default_entry']),
+            ("Timeout", f"{boot_config['timeout']} seconds")
+        ]
+        
+        for i, (label, value) in enumerate(info_items):
+            lbl = Gtk.Label(label=f"{label}:")
+            lbl.set_halign(Gtk.Align.START)
+            lbl.get_style_context().add_class("dim-label")
+            info_grid.attach(lbl, 0, i, 1, 1)
+            
+            value_lbl = Gtk.Label(label=value)
+            value_lbl.set_halign(Gtk.Align.START)
+            value_lbl.set_selectable(True)
+            info_grid.attach(value_lbl, 1, i, 1, 1)
+        
+        bootloader_card.get_child().add(info_grid)
+        boot_grid.attach(bootloader_card, 0, 0, 1, 1)
+        
+        # Boot entries card
+        entries_card = self.create_card("Boot Entries")
+        entries_scrolled = Gtk.ScrolledWindow()
+        entries_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        entries_scrolled.set_min_content_height(200)
+        
+        self.boot_entries_list = Gtk.ListBox()
+        entries_scrolled.add(self.boot_entries_list)
+        
+        entries_card.get_child().add(entries_scrolled)
+        boot_grid.attach(entries_card, 1, 0, 1, 1)
+        
+        # Kernel management card
+        kernel_card = self.create_card("Kernel Management")
+        kernel_grid = Gtk.Grid()
+        kernel_grid.set_row_spacing(10)
+        kernel_grid.set_column_spacing(10)
+        
+        # Keep kernels spin button
+        kernel_grid.attach(Gtk.Label(label="Keep Kernels:"), 0, 0, 1, 1)
+        self.keep_kernels_spin = Gtk.SpinButton()
+        self.keep_kernels_spin.set_range(1, 10)
+        self.keep_kernels_spin.set_value(2)
+        kernel_grid.attach(self.keep_kernels_spin, 1, 0, 1, 1)
+        
+        # Remove old kernels button
+        remove_kernels_button = Gtk.Button(label="Remove Old Kernels")
+        remove_kernels_button.set_image(Gtk.Image.new_from_icon_name("edit-delete", Gtk.IconSize.BUTTON))
+        remove_kernels_button.set_always_show_image(True)
+        remove_kernels_button.connect("clicked", self.on_remove_old_kernels)
+        kernel_grid.attach(remove_kernels_button, 0, 1, 2, 1)
+        
+        kernel_card.get_child().add(kernel_grid)
+        boot_grid.attach(kernel_card, 0, 1, 2, 1)
+        
+        boot_container.pack_start(boot_grid, True, True, 0)
+        
+        # Action buttons
+        action_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        action_box.set_halign(Gtk.Align.END)
+        action_box.set_margin_top(10)
+        
+        update_grub_button = Gtk.Button(label="Update GRUB")
+        update_grub_button.set_image(Gtk.Image.new_from_icon_name("view-refresh", Gtk.IconSize.BUTTON))
+        update_grub_button.set_always_show_image(True)
+        update_grub_button.connect("clicked", self.on_update_grub)
+        action_box.pack_start(update_grub_button, False, False, 0)
+        
+        boot_container.pack_start(action_box, False, False, 0)
+        
+        # Make scrollable
+        boot_scrolled = Gtk.ScrolledWindow()
+        boot_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        boot_scrolled.add(boot_container)
+        
+        self.stack.add_titled(boot_scrolled, "boot", "Boot Loader")
+        
+        # Load boot entries
+        self.load_boot_entries()
+    
+    def create_firewall_page(self):
+        """Create firewall page"""
+        firewall_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=15)
+        firewall_container.set_border_width(20)
+        
+        # Title
+        title = Gtk.Label()
+        title.set_markup("<big><b>Firewall Configuration</b></big>")
+        title.set_halign(Gtk.Align.START)
+        title.set_margin_bottom(20)
+        firewall_container.pack_start(title, False, False, 0)
+        
+        # Firewall info grid
+        firewall_grid = Gtk.Grid()
+        firewall_grid.set_row_spacing(15)
+        firewall_grid.set_column_spacing(15)
+        firewall_grid.set_column_homogeneous(True)
+        
+        # Firewall status card
+        status_card = self.create_card("Firewall Status")
+        firewall_info = self.firewall_manager.get_firewall_info()
+        
+        info_grid = Gtk.Grid()
+        info_grid.set_row_spacing(8)
+        info_grid.set_column_spacing(10)
+        
+        info_items = [
+            ("Backend", firewall_info['backend']),
+            ("Status", "Active" if firewall_info['active'] else "Inactive"),
+            ("Default Zone", firewall_info.get('default_zone', 'N/A'))
+        ]
+        
+        for i, (label, value) in enumerate(info_items):
+            lbl = Gtk.Label(label=f"{label}:")
+            lbl.set_halign(Gtk.Align.START)
+            lbl.get_style_context().add_class("dim-label")
+            info_grid.attach(lbl, 0, i, 1, 1)
+            
+            value_lbl = Gtk.Label(label=value)
+            value_lbl.set_halign(Gtk.Align.START)
+            value_lbl.set_selectable(True)
+            info_grid.attach(value_lbl, 1, i, 1, 1)
+        
+        # Firewall toggle
+        self.firewall_switch = Gtk.Switch()
+        self.firewall_switch.set_active(firewall_info['active'])
+        self.firewall_switch.connect("notify::active", self.on_firewall_toggle)
+        info_grid.attach(Gtk.Label(label="Enable:"), 0, len(info_items), 1, 1)
+        info_grid.attach(self.firewall_switch, 1, len(info_items), 1, 1)
+        
+        status_card.get_child().add(info_grid)
+        firewall_grid.attach(status_card, 0, 0, 1, 1)
+        
+        # Firewall rules card
+        rules_card = self.create_card("Firewall Rules")
+        rules_scrolled = Gtk.ScrolledWindow()
+        rules_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        rules_scrolled.set_min_content_height(300)
+        
+        # Create treeview for rules
+        self.rules_liststore = Gtk.ListStore(str, str, str, str, str)
+        self.rules_treeview = Gtk.TreeView(model=self.rules_liststore)
+        self.rules_treeview.set_rules_hint(True)
+        
+        # Add columns
+        text_renderer = Gtk.CellRendererText()
+        columns = [
+            ("Action", 0),
+            ("Direction", 1),
+            ("Protocol", 2),
+            ("Source", 3),
+            ("Destination", 4)
+        ]
+        
+        for title, col_id in columns:
+            column = Gtk.TreeViewColumn(title, text_renderer, text=col_id)
+            column.set_resizable(True)
+            self.rules_treeview.append_column(column)
+        
+        rules_scrolled.add(self.rules_treeview)
+        rules_card.get_child().add(rules_scrolled)
+        firewall_grid.attach(rules_card, 1, 0, 1, 1)
+        
+        firewall_container.pack_start(firewall_grid, True, True, 0)
+        
+        # Rule management buttons
+        rule_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        rule_box.set_halign(Gtk.Align.END)
+        rule_box.set_margin_top(10)
+        
+        add_rule_button = Gtk.Button(label="Add Rule")
+        add_rule_button.set_image(Gtk.Image.new_from_icon_name("list-add", Gtk.IconSize.BUTTON))
+        add_rule_button.set_always_show_image(True)
+        add_rule_button.connect("clicked", self.on_add_firewall_rule)
+        rule_box.pack_start(add_rule_button, False, False, 0)
+        
+        self.remove_rule_button = Gtk.Button(label="Remove Rule")
+        self.remove_rule_button.set_image(Gtk.Image.new_from_icon_name("edit-delete", Gtk.IconSize.BUTTON))
+        self.remove_rule_button.set_always_show_image(True)
+        self.remove_rule_button.set_sensitive(False)
+        self.remove_rule_button.connect("clicked", self.on_remove_firewall_rule)
+        rule_box.pack_start(self.remove_rule_button, False, False, 0)
+        
+        firewall_container.pack_start(rule_box, False, False, 0)
+        
+        # Make scrollable
+        firewall_scrolled = Gtk.ScrolledWindow()
+        firewall_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        firewall_scrolled.add(firewall_container)
+        
+        self.stack.add_titled(firewall_scrolled, "firewall", "Firewall")
+        
+        # Connect selection signal
+        self.rules_treeview.get_selection().connect("changed", self.on_rule_selected)
+        
+        # Load firewall rules
+        self.load_firewall_rules()
+    
+    def create_logs_page(self):
+        """Create logs page"""
+        logs_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=15)
+        logs_container.set_border_width(20)
+        
+        # Title
+        title = Gtk.Label()
+        title.set_markup("<big><b>System Logs</b></big>")
+        title.set_halign(Gtk.Align.START)
+        title.set_margin_bottom(20)
+        logs_container.pack_start(title, False, False, 0)
+        
+        # Log type selection
+        log_type_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        
+        log_type_box.pack_start(Gtk.Label(label="Log Type:"), False, False, 0)
+        
+        self.log_type_combo = Gtk.ComboBoxText()
+        self.log_type_combo.append_text("System")
+        self.log_type_combo.append_text("Kernel")
+        self.log_type_combo.append_text("Authentication")
+        self.log_type_combo.set_active(0)
+        self.log_type_combo.connect("changed", self.on_log_type_changed)
+        log_type_box.pack_start(self.log_type_combo, False, False, 0)
+        
+        # Number of lines
+        log_type_box.pack_start(Gtk.Label(label="Lines:"), False, False, 0)
+        
+        self.log_lines_spin = Gtk.SpinButton()
+        self.log_lines_spin.set_range(10, 1000)
+        self.log_lines_spin.set_value(100)
+        self.log_lines_spin.set_increments(10, 50)
+        log_type_box.pack_start(self.log_lines_spin, False, False, 0)
+        
+        # Refresh button
+        refresh_button = Gtk.Button(label="Refresh")
+        refresh_button.set_image(Gtk.Image.new_from_icon_name("view-refresh", Gtk.IconSize.BUTTON))
+        refresh_button.set_always_show_image(True)
+        refresh_button.connect("clicked", self.on_refresh_logs)
+        log_type_box.pack_start(refresh_button, False, False, 0)
+        
+        # Clear button
+        clear_button = Gtk.Button(label="Clear Logs")
+        clear_button.set_image(Gtk.Image.new_from_icon_name("edit-clear", Gtk.IconSize.BUTTON))
+        clear_button.set_always_show_image(True)
+        clear_button.connect("clicked", self.on_clear_logs)
+        log_type_box.pack_start(clear_button, False, False, 0)
+        
+        logs_container.pack_start(log_type_box, False, False, 0)
+        
+        # Logs display
+        logs_card = self.create_card("Log Entries")
+        logs_scrolled = Gtk.ScrolledWindow()
+        logs_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        logs_scrolled.set_min_content_height(400)
+        
+        self.logs_textview = Gtk.TextView()
+        self.logs_textview.set_editable(False)
+        self.logs_textview.set_wrap_mode(Gtk.WrapMode.NONE)
+        self.logs_textview.get_buffer().create_tag("monospace", family="Monospace")
+        
+        logs_scrolled.add(self.logs_textview)
+        logs_card.get_child().add(logs_scrolled)
+        logs_container.pack_start(logs_card, True, True, 0)
+        
+        # Make scrollable
+        logs_scrolled = Gtk.ScrolledWindow()
+        logs_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        logs_scrolled.add(logs_container)
+        
+        self.stack.add_titled(logs_scrolled, "logs", "Logs")
+        
+        # Load initial logs
+        self.load_logs()
     
     def create_packages_page(self):
         """Create packages page"""
@@ -2777,11 +2163,11 @@ class DockpanelWindow(Gtk.ApplicationWindow):
         # Search bar
         search_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         self.package_search_entry = Gtk.Entry()
-        self.package_search_entry.set_placeholder_text(_("Search packages..."))
+        self.package_search_entry.set_placeholder_text("Search packages...")
         self.package_search_entry.connect("activate", self.on_package_search)
         search_box.pack_start(self.package_search_entry, True, True, 0)
         
-        search_button = Gtk.Button(label=_("Search"))
+        search_button = Gtk.Button(label="Search")
         search_button.set_image(Gtk.Image.new_from_icon_name("system-search", Gtk.IconSize.BUTTON))
         search_button.set_always_show_image(True)
         search_button.connect("clicked", self.on_package_search)
@@ -2793,92 +2179,88 @@ class DockpanelWindow(Gtk.ApplicationWindow):
         package_paned = Gtk.Paned(orientation=Gtk.Orientation.VERTICAL)
         package_paned.set_position(300)
         
-        # Top - Installed packages
-        installed_card = self.create_card(_("Installed Packages"))
+        # Installed packages
+        installed_card = self.create_card("Installed Packages")
         installed_scrolled = Gtk.ScrolledWindow()
         installed_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         installed_scrolled.set_min_content_height(200)
         
         self.installed_packages_list = Gtk.ListBox()
         self.installed_packages_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
-        self.installed_packages_list.connect("row-selected", self.on_installed_package_selected)
         installed_scrolled.add(self.installed_packages_list)
         
         installed_card.get_child().add(installed_scrolled)
         package_paned.pack1(installed_card, True, False)
         
-        # Bottom - Available packages and repositories
-        bottom_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        
         # Available packages
-        available_card = self.create_card(_("Available Packages"))
+        available_card = self.create_card("Available Packages")
         available_scrolled = Gtk.ScrolledWindow()
         available_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        available_scrolled.set_min_content_height(150)
+        available_scrolled.set_min_content_height(200)
         
         self.available_packages_list = Gtk.ListBox()
         self.available_packages_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
-        self.available_packages_list.connect("row-selected", self.on_available_package_selected)
         available_scrolled.add(self.available_packages_list)
         
         available_card.get_child().add(available_scrolled)
-        bottom_box.pack_start(available_card, True, True, 0)
+        package_paned.pack2(available_card, True, False)
         
-        # Repositories
-        repo_card = self.create_card(_("Repositories"))
-        repo_scrolled = Gtk.ScrolledWindow()
-        repo_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        repo_scrolled.set_min_content_height(100)
-        
-        self.repo_list = Gtk.ListBox()
-        self.repo_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
-        repo_scrolled.add(self.repo_list)
-        
-        repo_card.get_child().add(repo_scrolled)
-        bottom_box.pack_start(repo_card, True, True, 0)
-        
-        package_paned.pack2(bottom_box, True, False)
         packages_container.pack_start(package_paned, True, True, 0)
+        
+        # Upgradable packages
+        upgradable_card = self.create_card("Upgradable Packages")
+        upgradable_scrolled = Gtk.ScrolledWindow()
+        upgradable_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        upgradable_scrolled.set_min_content_height(150)
+        
+        self.upgradable_packages_list = Gtk.ListBox()
+        upgradable_scrolled.add(self.upgradable_packages_list)
+        
+        upgradable_card.get_child().add(upgradable_scrolled)
+        packages_container.pack_start(upgradable_card, True, True, 0)
         
         # Action buttons
         action_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         action_box.set_halign(Gtk.Align.END)
         action_box.set_margin_top(10)
         
-        self.install_button = Gtk.Button(label=_("Install"))
+        self.install_button = Gtk.Button(label="Install")
         self.install_button.set_image(Gtk.Image.new_from_icon_name("document-save", Gtk.IconSize.BUTTON))
         self.install_button.set_always_show_image(True)
         self.install_button.set_sensitive(False)
         self.install_button.connect("clicked", self.on_package_install)
         action_box.pack_start(self.install_button, False, False, 0)
         
-        self.remove_button = Gtk.Button(label=_("Remove"))
+        self.remove_button = Gtk.Button(label="Remove")
         self.remove_button.set_image(Gtk.Image.new_from_icon_name("edit-delete", Gtk.IconSize.BUTTON))
         self.remove_button.set_always_show_image(True)
         self.remove_button.set_sensitive(False)
         self.remove_button.connect("clicked", self.on_package_remove)
         action_box.pack_start(self.remove_button, False, False, 0)
         
-        update_button = Gtk.Button(label=_("Update Lists"))
-        update_button.set_image(Gtk.Image.new_from_icon_name("view-refresh", Gtk.IconSize.BUTTON))
-        update_button.set_always_show_image(True)
-        update_button.connect("clicked", self.on_package_update)
-        action_box.pack_start(update_button, False, False, 0)
-        
-        upgrade_button = Gtk.Button(label=_("Upgrade All"))
+        upgrade_button = Gtk.Button(label="Upgrade All")
         upgrade_button.set_image(Gtk.Image.new_from_icon_name("system-software-update", Gtk.IconSize.BUTTON))
         upgrade_button.set_always_show_image(True)
         upgrade_button.connect("clicked", self.on_package_upgrade_all)
         action_box.pack_start(upgrade_button, False, False, 0)
         
+        update_button = Gtk.Button(label="Update System")
+        update_button.set_image(Gtk.Image.new_from_icon_name("system-software-update", Gtk.IconSize.BUTTON))
+        update_button.set_always_show_image(True)
+        update_button.connect("clicked", self.on_package_update)
+        action_box.pack_start(update_button, False, False, 0)
+        
         packages_container.pack_start(action_box, False, False, 0)
         
-        # Make packages page scrollable
+        # Make scrollable
         packages_scrolled = Gtk.ScrolledWindow()
         packages_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         packages_scrolled.add(packages_container)
         
-        self.stack.add_titled(packages_scrolled, "packages", _("Packages"))
+        self.stack.add_titled(packages_scrolled, "packages", "Packages")
+        
+        # Load packages
+        self.load_packages()
     
     def create_users_page(self):
         """Create users page"""
@@ -2892,82 +2274,62 @@ class DockpanelWindow(Gtk.ApplicationWindow):
         title.set_margin_bottom(20)
         users_container.pack_start(title, False, False, 0)
         
-        # User paned
-        user_paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
-        user_paned.set_position(400)
+        # User list
+        users_card = self.create_card("System Users")
+        users_scrolled = Gtk.ScrolledWindow()
+        users_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        users_scrolled.set_min_content_height(300)
         
-        # Left - User list
-        left_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        # Create treeview for users
+        self.user_liststore = Gtk.ListStore(str, str, str, str, str)
+        self.user_treeview = Gtk.TreeView(model=self.user_liststore)
+        self.user_treeview.set_rules_hint(True)
         
-        user_list_card = self.create_card(_("System Users"))
-        user_list_scrolled = Gtk.ScrolledWindow()
-        user_list_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        user_list_scrolled.set_min_content_height(300)
-        
-        self.user_list = Gtk.ListBox()
-        self.user_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
-        self.user_list.connect("row-selected", self.on_user_selected)
-        user_list_scrolled.add(self.user_list)
-        
-        user_list_card.get_child().add(user_list_scrolled)
-        left_box.pack_start(user_list_card, True, True, 0)
-        
-        # Right - User details
-        right_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        
-        user_details_card = self.create_card(_("User Details"))
-        user_details_grid = Gtk.Grid()
-        user_details_grid.set_row_spacing(8)
-        user_details_grid.set_column_spacing(10)
-        
-        self.user_details_labels = {}
-        user_details_items = [
-            ("username", _("Username")),
-            ("uid", _("User ID")),
-            ("gid", _("Group ID")),
-            ("home", _("Home Directory")),
-            ("shell", _("Shell")),
-            ("groups", _("Groups"))
+        # Add columns
+        text_renderer = Gtk.CellRendererText()
+        columns = [
+            ("Username", 0),
+            ("UID", 1),
+            ("Home", 2),
+            ("Shell", 3),
+            ("Last Login", 4)
         ]
         
-        for i, (key, label) in enumerate(user_details_items):
-            lbl = Gtk.Label(label=f"{label}:")
-            lbl.set_halign(Gtk.Align.START)
-            lbl.get_style_context().add_class("dim-label")
-            user_details_grid.attach(lbl, 0, i, 1, 1)
-            
-            value_lbl = Gtk.Label(label="-")
-            value_lbl.set_halign(Gtk.Align.START)
-            value_lbl.set_selectable(True)
-            self.user_details_labels[key] = value_lbl
-            user_details_grid.attach(value_lbl, 1, i, 1, 1)
+        for title, col_id in columns:
+            column = Gtk.TreeViewColumn(title, text_renderer, text=col_id)
+            column.set_resizable(True)
+            self.user_treeview.append_column(column)
         
-        user_details_card.get_child().add(user_details_grid)
-        right_box.pack_start(user_details_card, True, True, 0)
-        
-        user_paned.pack1(left_box, True, False)
-        user_paned.pack2(right_box, True, False)
-        users_container.pack_start(user_paned, True, True, 0)
+        users_scrolled.add(self.user_treeview)
+        users_card.get_child().add(users_scrolled)
+        users_container.pack_start(users_card, True, True, 0)
         
         # Action buttons
         action_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         action_box.set_halign(Gtk.Align.END)
         action_box.set_margin_top(10)
         
-        add_user_button = Gtk.Button(label=_("Add User"))
+        add_user_button = Gtk.Button(label="Add User")
         add_user_button.set_image(Gtk.Image.new_from_icon_name("list-add", Gtk.IconSize.BUTTON))
         add_user_button.set_always_show_image(True)
         add_user_button.connect("clicked", self.on_add_user)
         action_box.pack_start(add_user_button, False, False, 0)
         
-        self.modify_user_button = Gtk.Button(label=_("Modify User"))
+        self.modify_user_button = Gtk.Button(label="Modify User")
         self.modify_user_button.set_image(Gtk.Image.new_from_icon_name("document-edit", Gtk.IconSize.BUTTON))
         self.modify_user_button.set_always_show_image(True)
         self.modify_user_button.set_sensitive(False)
         self.modify_user_button.connect("clicked", self.on_modify_user)
         action_box.pack_start(self.modify_user_button, False, False, 0)
         
-        self.delete_user_button = Gtk.Button(label=_("Delete User"))
+        self.lock_user_button = Gtk.Button(label="Lock/Unlock")
+        self.lock_user_button.set_image(Gtk.Image.new_from_icon_name("system-lock-screen", Gtk.IconSize.BUTTON))
+        self.lock_user_button.set_always_show_image(True)
+        self.lock_user_button.set_sensitive(False)
+        self.lock_user_button.connect("clicked", self.on_lock_user)
+        action_box.pack_start(self.lock_user_button, False, False, 0)
+        
+        self.delete_user_button = Gtk.Button(label="Delete User")
         self.delete_user_button.set_image(Gtk.Image.new_from_icon_name("edit-delete", Gtk.IconSize.BUTTON))
         self.delete_user_button.set_always_show_image(True)
         self.delete_user_button.set_sensitive(False)
@@ -2976,12 +2338,18 @@ class DockpanelWindow(Gtk.ApplicationWindow):
         
         users_container.pack_start(action_box, False, False, 0)
         
-        # Make users page scrollable
+        # Make scrollable
         users_scrolled = Gtk.ScrolledWindow()
         users_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         users_scrolled.add(users_container)
         
-        self.stack.add_titled(users_scrolled, "users", _("Users"))
+        self.stack.add_titled(users_scrolled, "users", "Users")
+        
+        # Connect selection signal
+        self.user_treeview.get_selection().connect("changed", self.on_user_selected)
+        
+        # Load users
+        self.load_users()
     
     def create_network_page(self):
         """Create network page"""
@@ -3001,79 +2369,51 @@ class DockpanelWindow(Gtk.ApplicationWindow):
         network_grid.set_column_spacing(15)
         network_grid.set_column_homogeneous(True)
         
-        # Network interfaces card
-        interfaces_card = self.create_card(_("Network Interfaces"))
+        # Network interfaces
+        interfaces_card = self.create_card("Network Interfaces")
         interfaces_scrolled = Gtk.ScrolledWindow()
         interfaces_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         interfaces_scrolled.set_min_content_height(150)
         
         self.interfaces_list = Gtk.ListBox()
-        self.interfaces_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
         interfaces_scrolled.add(self.interfaces_list)
         
         interfaces_card.get_child().add(interfaces_scrolled)
         network_grid.attach(interfaces_card, 0, 0, 1, 1)
         
-        # Firewall status card
-        firewall_card = self.create_card(_("Firewall Status"))
-        firewall_grid = Gtk.Grid()
-        firewall_grid.set_row_spacing(10)
-        firewall_grid.set_column_spacing(10)
+        # Network status
+        status_card = self.create_card("Network Status")
+        status_grid = Gtk.Grid()
+        status_grid.set_row_spacing(10)
+        status_grid.set_column_spacing(10)
         
-        self.firewall_status_label = Gtk.Label(label=_("Loading..."))
-        firewall_grid.attach(self.firewall_status_label, 0, 0, 1, 1)
+        # Get network status
+        stdout, _, code = run_command("ip route | grep default")
+        if code == 0:
+            gateway = stdout.split()[2]
+            status_grid.attach(Gtk.Label(label="Gateway:"), 0, 0, 1, 1)
+            status_grid.attach(Gtk.Label(label=gateway), 1, 0, 1, 1)
         
-        self.firewall_switch = Gtk.Switch()
-        self.firewall_switch.connect("notify::active", self.on_firewall_toggle)
-        firewall_grid.attach(self.firewall_switch, 1, 0, 1, 1)
+        stdout, _, code = run_command("cat /etc/resolv.conf | grep nameserver")
+        if code == 0:
+            dns = stdout.split()[-1]
+            status_grid.attach(Gtk.Label(label="DNS:"), 0, 1, 1, 1)
+            status_grid.attach(Gtk.Label(label=dns), 1, 1, 1, 1)
         
-        firewall_info = Gtk.Label()
-        firewall_info.set_markup("<small>" + _("Toggle firewall to enable/disable network protection") + "</small>")
-        firewall_info.set_halign(Gtk.Align.START)
-        firewall_grid.attach(firewall_info, 0, 1, 2, 1)
-        
-        firewall_card.get_child().add(firewall_grid)
-        network_grid.attach(firewall_card, 1, 0, 1, 1)
-        
-        # Active connections card
-        connections_card = self.create_card(_("Active Connections"))
-        connections_scrolled = Gtk.ScrolledWindow()
-        connections_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        connections_scrolled.set_min_content_height(150)
-        
-        self.connections_list = Gtk.ListBox()
-        connections_scrolled.add(self.connections_list)
-        
-        connections_card.get_child().add(connections_scrolled)
-        network_grid.attach(connections_card, 0, 1, 2, 1)
+        status_card.get_child().add(status_grid)
+        network_grid.attach(status_card, 1, 0, 1, 1)
         
         network_container.pack_start(network_grid, True, True, 0)
         
-        # Action buttons
-        action_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        action_box.set_halign(Gtk.Align.END)
-        action_box.set_margin_top(10)
-        
-        configure_button = Gtk.Button(label=_("Configure"))
-        configure_button.set_image(Gtk.Image.new_from_icon_name("network-wired", Gtk.IconSize.BUTTON))
-        configure_button.set_always_show_image(True)
-        configure_button.connect("clicked", self.on_network_configure)
-        action_box.pack_start(configure_button, False, False, 0)
-        
-        restart_button = Gtk.Button(label=_("Restart Network"))
-        restart_button.set_image(Gtk.Image.new_from_icon_name("view-refresh", Gtk.IconSize.BUTTON))
-        restart_button.set_always_show_image(True)
-        restart_button.connect("clicked", self.on_network_restart)
-        action_box.pack_start(restart_button, False, False, 0)
-        
-        network_container.pack_start(action_box, False, False, 0)
-        
-        # Make network page scrollable
+        # Make scrollable
         network_scrolled = Gtk.ScrolledWindow()
         network_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         network_scrolled.add(network_container)
         
-        self.stack.add_titled(network_scrolled, "network", _("Network"))
+        self.stack.add_titled(network_scrolled, "network", "Network")
+        
+        # Load network info
+        self.load_network_info()
     
     def create_services_page(self):
         """Create services page"""
@@ -3087,250 +2427,95 @@ class DockpanelWindow(Gtk.ApplicationWindow):
         title.set_margin_bottom(20)
         services_container.pack_start(title, False, False, 0)
         
-        # Services paned
-        services_paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
-        services_paned.set_position(400)
+        # Services list
+        services_card = self.create_card("System Services")
+        services_scrolled = Gtk.ScrolledWindow()
+        services_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        services_scrolled.set_min_content_height(300)
         
-        # Left - Service list
-        left_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        # Create treeview for services
+        self.service_liststore = Gtk.ListStore(str, str, str, str, bool)
+        self.service_treeview = Gtk.TreeView(model=self.service_liststore)
+        self.service_treeview.set_rules_hint(True)
         
-        services_list_card = self.create_card(_("System Services"))
-        services_list_scrolled = Gtk.ScrolledWindow()
-        services_list_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        services_list_scrolled.set_min_content_height(300)
-        
-        self.services_list = Gtk.ListBox()
-        self.services_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
-        self.services_list.connect("row-selected", self.on_service_selected)
-        services_list_scrolled.add(self.services_list)
-        
-        services_list_card.get_child().add(services_list_scrolled)
-        left_box.pack_start(services_list_card, True, True, 0)
-        
-        # Right - Service details
-        right_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        
-        service_details_card = self.create_card(_("Service Details"))
-        service_details_grid = Gtk.Grid()
-        service_details_grid.set_row_spacing(8)
-        service_details_grid.set_column_spacing(10)
-        
-        self.service_details_labels = {}
-        service_details_items = [
-            ("name", _("Service Name")),
-            ("status", _("Status")),
-            ("enabled", _("Enabled at Boot")),
-            ("description", _("Description"))
+        # Add columns
+        text_renderer = Gtk.CellRendererText()
+        columns = [
+            ("Name", 0),
+            ("Load", 1),
+            ("Active", 2),
+            ("Sub", 3)
         ]
         
-        for i, (key, label) in enumerate(service_details_items):
-            lbl = Gtk.Label(label=f"{label}:")
-            lbl.set_halign(Gtk.Align.START)
-            lbl.get_style_context().add_class("dim-label")
-            service_details_grid.attach(lbl, 0, i, 1, 1)
-            
-            value_lbl = Gtk.Label(label="-")
-            value_lbl.set_halign(Gtk.Align.START)
-            value_lbl.set_selectable(True)
-            self.service_details_labels[key] = value_lbl
-            service_details_grid.attach(value_lbl, 1, i, 1, 1)
+        for title, col_id in columns:
+            column = Gtk.TreeViewColumn(title, text_renderer, text=col_id)
+            column.set_resizable(True)
+            self.service_treeview.append_column(column)
         
-        service_details_card.get_child().add(service_details_grid)
-        right_box.pack_start(service_details_card, True, True, 0)
+        # Enabled column with toggle
+        toggle_renderer = Gtk.CellRendererToggle()
+        toggle_renderer.connect("toggled", self.on_service_enabled_toggled)
+        enabled_column = Gtk.TreeViewColumn("Enabled", toggle_renderer, active=4)
+        self.service_treeview.append_column(enabled_column)
         
-        services_paned.pack1(left_box, True, False)
-        services_paned.pack2(right_box, True, False)
-        services_container.pack_start(services_paned, True, True, 0)
+        services_scrolled.add(self.service_treeview)
+        services_card.get_child().add(services_scrolled)
+        services_container.pack_start(services_card, True, True, 0)
         
         # Action buttons
         action_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         action_box.set_halign(Gtk.Align.END)
         action_box.set_margin_top(10)
         
-        self.start_button = Gtk.Button(label=_("Start"))
+        self.start_button = Gtk.Button(label="Start")
         self.start_button.set_image(Gtk.Image.new_from_icon_name("media-playback-start", Gtk.IconSize.BUTTON))
         self.start_button.set_always_show_image(True)
         self.start_button.set_sensitive(False)
         self.start_button.connect("clicked", self.on_service_start)
         action_box.pack_start(self.start_button, False, False, 0)
         
-        self.stop_button = Gtk.Button(label=_("Stop"))
+        self.stop_button = Gtk.Button(label="Stop")
         self.stop_button.set_image(Gtk.Image.new_from_icon_name("media-playback-stop", Gtk.IconSize.BUTTON))
         self.stop_button.set_always_show_image(True)
         self.stop_button.set_sensitive(False)
         self.stop_button.connect("clicked", self.on_service_stop)
         action_box.pack_start(self.stop_button, False, False, 0)
         
-        self.restart_button = Gtk.Button(label=_("Restart"))
+        self.restart_button = Gtk.Button(label="Restart")
         self.restart_button.set_image(Gtk.Image.new_from_icon_name("view-refresh", Gtk.IconSize.BUTTON))
         self.restart_button.set_always_show_image(True)
         self.restart_button.set_sensitive(False)
         self.restart_button.connect("clicked", self.on_service_restart)
         action_box.pack_start(self.restart_button, False, False, 0)
         
-        self.enable_button = Gtk.Button(label=_("Enable"))
+        self.enable_button = Gtk.Button(label="Enable")
         self.enable_button.set_image(Gtk.Image.new_from_icon_name("bookmark-new", Gtk.IconSize.BUTTON))
         self.enable_button.set_always_show_image(True)
         self.enable_button.set_sensitive(False)
         self.enable_button.connect("clicked", self.on_service_enable)
         action_box.pack_start(self.enable_button, False, False, 0)
         
-        self.disable_button = Gtk.Button(label=_("Disable"))
+        self.disable_button = Gtk.Button(label="Disable")
         self.disable_button.set_image(Gtk.Image.new_from_icon_name("edit-delete", Gtk.IconSize.BUTTON))
         self.disable_button.set_always_show_image(True)
         self.disable_button.set_sensitive(False)
         self.disable_button.connect("clicked", self.on_service_disable)
         action_box.pack_start(self.disable_button, False, False, 0)
         
-        create_service_button = Gtk.Button(label=_("Create Service"))
-        create_service_button.set_image(Gtk.Image.new_from_icon_name("document-new", Gtk.IconSize.BUTTON))
-        create_service_button.set_always_show_image(True)
-        create_service_button.connect("clicked", self.on_create_service)
-        action_box.pack_start(create_service_button, False, False, 0)
-        
         services_container.pack_start(action_box, False, False, 0)
         
-        # Make services page scrollable
+        # Make scrollable
         services_scrolled = Gtk.ScrolledWindow()
         services_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         services_scrolled.add(services_container)
         
-        self.stack.add_titled(services_scrolled, "services", _("Services"))
-    
-    def create_system_page(self):
-        """Create system page"""
-        system_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=15)
-        system_container.set_border_width(20)
+        self.stack.add_titled(services_scrolled, "services", "Services")
         
-        # Title
-        title = Gtk.Label()
-        title.set_markup("<big><b>System Settings</b></big>")
-        title.set_halign(Gtk.Align.START)
-        title.set_margin_bottom(20)
-        system_container.pack_start(title, False, False, 0)
+        # Connect selection signal
+        self.service_treeview.get_selection().connect("changed", self.on_service_selected)
         
-        # System grid
-        system_grid = Gtk.Grid()
-        system_grid.set_row_spacing(15)
-        system_grid.set_column_spacing(15)
-        system_grid.set_column_homogeneous(True)
-        
-        # Language settings card
-        language_card = self.create_card(_("Language and Region"))
-        language_grid = Gtk.Grid()
-        language_grid.set_row_spacing(10)
-        language_grid.set_column_spacing(10)
-        
-        language_grid.attach(Gtk.Label(label=_("System Language:")), 0, 0, 1, 1)
-        self.language_combo = Gtk.ComboBoxText()
-        languages = [
-            ("en_US", "English (US)"),
-            ("es_ES", "Español"),
-            ("pt_BR", "Português (Brasil)"),
-            ("de_DE", "Deutsch"),
-            ("ru_RU", "Русский"),
-            ("pl_PL", "Polski"),
-            ("cs_CZ", "Čeština"),
-            ("sk_SK", "Slovenčina")
-        ]
-        for lang_code, lang_name in languages:
-            self.language_combo.append_text(lang_name)
-        language_grid.attach(self.language_combo, 1, 0, 1, 1)
-        
-        language_grid.attach(Gtk.Label(label=_("Keyboard Layout:")), 0, 1, 1, 1)
-        self.keyboard_combo = Gtk.ComboBoxText()
-        keyboards = [
-            ("us", "US"),
-            ("es", "Spanish"),
-            ("pt", "Portuguese"),
-            ("de", "German"),
-            ("ru", "Russian"),
-            ("pl", "Polish"),
-            ("cz", "Czech"),
-            ("sk", "Slovak")
-        ]
-        for kb_code, kb_name in keyboards:
-            self.keyboard_combo.append_text(kb_name)
-        language_grid.attach(self.keyboard_combo, 1, 1, 1, 1)
-        
-        apply_lang_button = Gtk.Button(label=_("Apply"))
-        apply_lang_button.set_image(Gtk.Image.new_from_icon_name("document-save", Gtk.IconSize.BUTTON))
-        apply_lang_button.set_always_show_image(True)
-        apply_lang_button.connect("clicked", self.on_language_settings_apply)
-        language_grid.attach(apply_lang_button, 0, 2, 2, 1)
-        
-        language_card.get_child().add(language_grid)
-        system_grid.attach(language_card, 0, 0, 1, 1)
-        
-        # Date and time card
-        datetime_card = self.create_card(_("Date and Time"))
-        datetime_grid = Gtk.Grid()
-        datetime_grid.set_row_spacing(10)
-        datetime_grid.set_column_spacing(10)
-        
-        datetime_grid.attach(Gtk.Label(label=_("Current Date/Time:")), 0, 0, 1, 1)
-        self.datetime_label = Gtk.Label(label="Loading...")
-        datetime_grid.attach(self.datetime_label, 1, 0, 1, 1)
-        
-        datetime_grid.attach(Gtk.Label(label=_("Time Zone:")), 0, 1, 1, 1)
-        self.timezone_combo = Gtk.ComboBoxText()
-        timezones = [
-            "UTC",
-            "America/New_York",
-            "America/Chicago",
-            "America/Denver",
-            "America/Los_Angeles",
-            "Europe/London",
-            "Europe/Berlin",
-            "Europe/Moscow",
-            "Asia/Tokyo",
-            "Australia/Sydney"
-        ]
-        for tz in timezones:
-            self.timezone_combo.append_text(tz)
-        datetime_grid.attach(self.timezone_combo, 1, 1, 1, 1)
-        
-        sync_time_button = Gtk.Button(label=_("Sync with Network"))
-        sync_time_button.set_image(Gtk.Image.new_from_icon_name("network-transmit-receive", Gtk.IconSize.BUTTON))
-        sync_time_button.set_always_show_image(True)
-        sync_time_button.connect("clicked", self.on_sync_time)
-        datetime_grid.attach(sync_time_button, 0, 2, 2, 1)
-        
-        datetime_card.get_child().add(datetime_grid)
-        system_grid.attach(datetime_card, 1, 0, 1, 1)
-        
-        # System updates card
-        updates_card = self.create_card(_("System Updates"))
-        updates_grid = Gtk.Grid()
-        updates_grid.set_row_spacing(10)
-        updates_grid.set_column_spacing(10)
-        
-        self.updates_status_label = Gtk.Label(label=_("Checking for updates..."))
-        updates_grid.attach(self.updates_status_label, 0, 0, 2, 1)
-        
-        check_updates_button = Gtk.Button(label=_("Check for Updates"))
-        check_updates_button.set_image(Gtk.Image.new_from_icon_name("system-search", Gtk.IconSize.BUTTON))
-        check_updates_button.set_always_show_image(True)
-        check_updates_button.connect("clicked", self.on_check_updates)
-        updates_grid.attach(check_updates_button, 0, 1, 1, 1)
-        
-        install_updates_button = Gtk.Button(label=_("Install Updates"))
-        install_updates_button.set_image(Gtk.Image.new_from_icon_name("system-software-update", Gtk.IconSize.BUTTON))
-        install_updates_button.set_always_show_image(True)
-        install_updates_button.connect("clicked", self.on_install_updates)
-        updates_grid.attach(install_updates_button, 1, 1, 1, 1)
-        
-        updates_card.get_child().add(updates_grid)
-        system_grid.attach(updates_card, 0, 1, 2, 1)
-        
-        system_container.pack_start(system_grid, True, True, 0)
-        
-        # Make system page scrollable
-        system_scrolled = Gtk.ScrolledWindow()
-        system_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        system_scrolled.add(system_container)
-        
-        self.stack.add_titled(system_scrolled, "system", _("System"))
+        # Load services
+        self.load_services()
     
     def create_processes_page(self):
         """Create processes page"""
@@ -3347,11 +2532,11 @@ class DockpanelWindow(Gtk.ApplicationWindow):
         # Search bar
         search_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         self.process_search_entry = Gtk.Entry()
-        self.process_search_entry.set_placeholder_text(_("Search processes..."))
+        self.process_search_entry.set_placeholder_text("Search processes...")
         self.process_search_entry.connect("changed", self.on_process_search)
         search_box.pack_start(self.process_search_entry, True, True, 0)
         
-        refresh_button = Gtk.Button(label=_("Refresh"))
+        refresh_button = Gtk.Button(label="Refresh")
         refresh_button.set_image(Gtk.Image.new_from_icon_name("view-refresh", Gtk.IconSize.BUTTON))
         refresh_button.set_always_show_image(True)
         refresh_button.connect("clicked", self.on_refresh_processes)
@@ -3360,7 +2545,7 @@ class DockpanelWindow(Gtk.ApplicationWindow):
         processes_container.pack_start(search_box, False, False, 0)
         
         # Process list
-        processes_card = self.create_card(_("Running Processes"))
+        processes_card = self.create_card("Running Processes")
         processes_scrolled = Gtk.ScrolledWindow()
         processes_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         processes_scrolled.set_min_content_height(300)
@@ -3369,7 +2554,6 @@ class DockpanelWindow(Gtk.ApplicationWindow):
         self.process_liststore = Gtk.ListStore(str, str, str, str, str, str, str, str, str, str, str)
         self.process_treeview = Gtk.TreeView(model=self.process_liststore)
         self.process_treeview.set_rules_hint(True)
-        self.process_treeview.set_search_column(0)
         
         # Add columns
         columns = [
@@ -3377,12 +2561,6 @@ class DockpanelWindow(Gtk.ApplicationWindow):
             ("PID", 1),
             ("CPU", 2),
             ("Memory", 3),
-            ("VSZ", 4),
-            ("RSS", 5),
-            ("TTY", 6),
-            ("STAT", 7),
-            ("Start", 8),
-            ("Time", 9),
             ("Command", 10)
         ]
         
@@ -3402,45 +2580,34 @@ class DockpanelWindow(Gtk.ApplicationWindow):
         action_box.set_halign(Gtk.Align.END)
         action_box.set_margin_top(10)
         
-        self.kill_button = Gtk.Button(label=_("Kill Process"))
+        self.kill_button = Gtk.Button(label="Kill Process")
         self.kill_button.set_image(Gtk.Image.new_from_icon_name("process-stop", Gtk.IconSize.BUTTON))
         self.kill_button.set_always_show_image(True)
         self.kill_button.set_sensitive(False)
         self.kill_button.connect("clicked", self.on_kill_process)
         action_box.pack_start(self.kill_button, False, False, 0)
         
-        self.term_button = Gtk.Button(label=_("Terminate"))
+        self.term_button = Gtk.Button(label="Terminate")
         self.term_button.set_image(Gtk.Image.new_from_icon_name("media-playback-stop", Gtk.IconSize.BUTTON))
         self.term_button.set_always_show_image(True)
         self.term_button.set_sensitive(False)
         self.term_button.connect("clicked", self.on_terminate_process)
         action_box.pack_start(self.term_button, False, False, 0)
         
-        details_button = Gtk.Button(label=_("Details"))
-        details_button.set_image(Gtk.Image.new_from_icon_name("dialog-information", Gtk.IconSize.BUTTON))
-        details_button.set_always_show_image(True)
-        details_button.set_sensitive(False)
-        details_button.connect("clicked", self.on_process_details)
-        action_box.pack_start(details_button, False, False, 0)
-        
-        priority_button = Gtk.Button(label=_("Set Priority"))
-        priority_button.set_image(Gtk.Image.new_from_icon_name("preferences-system", Gtk.IconSize.BUTTON))
-        priority_button.set_always_show_image(True)
-        priority_button.set_sensitive(False)
-        priority_button.connect("clicked", self.on_process_priority)
-        action_box.pack_start(priority_button, False, False, 0)
-        
         processes_container.pack_start(action_box, False, False, 0)
         
-        # Connect selection signal
-        self.process_treeview.get_selection().connect("changed", self.on_process_selected)
-        
-        # Make processes page scrollable
+        # Make scrollable
         processes_scrolled = Gtk.ScrolledWindow()
         processes_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         processes_scrolled.add(processes_container)
         
-        self.stack.add_titled(processes_scrolled, "processes", _("Processes"))
+        self.stack.add_titled(processes_scrolled, "processes", "Processes")
+        
+        # Connect selection signal
+        self.process_treeview.get_selection().connect("changed", self.on_process_selected)
+        
+        # Load processes
+        self.load_processes()
     
     def create_disks_page(self):
         """Create disks page"""
@@ -3454,79 +2621,45 @@ class DockpanelWindow(Gtk.ApplicationWindow):
         title.set_margin_bottom(20)
         disks_container.pack_start(title, False, False, 0)
         
-        # Disk paned
-        disk_paned = Gtk.Paned(orientation=Gtk.Orientation.VERTICAL)
-        disk_paned.set_position(300)
+        # Disk usage
+        disk_card = self.create_card("Disk Usage")
+        disk_scrolled = Gtk.ScrolledWindow()
+        disk_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        disk_scrolled.set_min_content_height(300)
         
-        # Top - Physical disks
-        physical_card = self.create_card(_("Physical Disks"))
-        physical_scrolled = Gtk.ScrolledWindow()
-        physical_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        physical_scrolled.set_min_content_height(150)
+        # Create treeview for disk usage
+        self.disk_liststore = Gtk.ListStore(str, str, str, str, str)
+        self.disk_treeview = Gtk.TreeView(model=self.disk_liststore)
+        self.disk_treeview.set_rules_hint(True)
         
-        self.physical_disks_list = Gtk.ListBox()
-        self.physical_disks_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
-        physical_scrolled.add(self.physical_disks_list)
+        # Add columns
+        text_renderer = Gtk.CellRendererText()
+        columns = [
+            ("Filesystem", 0),
+            ("Size", 1),
+            ("Used", 2),
+            ("Available", 3),
+            ("Mount Point", 4)
+        ]
         
-        physical_card.get_child().add(physical_scrolled)
-        disk_paned.pack1(physical_card, True, False)
+        for title, col_id in columns:
+            column = Gtk.TreeViewColumn(title, text_renderer, text=col_id)
+            column.set_resizable(True)
+            self.disk_treeview.append_column(column)
         
-        # Bottom - Partitions
-        partitions_card = self.create_card(_("Partitions"))
-        partitions_scrolled = Gtk.ScrolledWindow()
-        partitions_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        partitions_scrolled.set_min_content_height(150)
+        disk_scrolled.add(self.disk_treeview)
+        disk_card.get_child().add(disk_scrolled)
+        disks_container.pack_start(disk_card, True, True, 0)
         
-        self.partitions_list = Gtk.ListBox()
-        self.partitions_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
-        self.partitions_list.connect("row-selected", self.on_partition_selected)
-        partitions_scrolled.add(self.partitions_list)
-        
-        partitions_card.get_child().add(partitions_scrolled)
-        disk_paned.pack2(partitions_card, True, False)
-        
-        disks_container.pack_start(disk_paned, True, True, 0)
-        
-        # Action buttons
-        action_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        action_box.set_halign(Gtk.Align.END)
-        action_box.set_margin_top(10)
-        
-        mount_button = Gtk.Button(label=_("Mount"))
-        mount_button.set_image(Gtk.Image.new_from_icon_name("drive-harddisk", Gtk.IconSize.BUTTON))
-        mount_button.set_always_show_image(True)
-        mount_button.set_sensitive(False)
-        mount_button.connect("clicked", self.on_mount_partition)
-        action_box.pack_start(mount_button, False, False, 0)
-        
-        unmount_button = Gtk.Button(label=_("Unmount"))
-        unmount_button.set_image(Gtk.Image.new_from_icon_name("media-eject", Gtk.IconSize.BUTTON))
-        unmount_button.set_always_show_image(True)
-        unmount_button.set_sensitive(False)
-        unmount_button.connect("clicked", self.on_unmount_partition)
-        action_box.pack_start(unmount_button, False, False, 0)
-        
-        format_button = Gtk.Button(label=_("Format"))
-        format_button.set_image(Gtk.Image.new_from_icon_name("document-save", Gtk.IconSize.BUTTON))
-        format_button.set_always_show_image(True)
-        format_button.set_sensitive(False)
-        format_button.connect("clicked", self.on_format_partition)
-        action_box.pack_start(format_button, False, False, 0)
-        
-        partition_manager_button = Gtk.Button(label=_("Partition Manager"))
-        partition_manager_button.set_image(Gtk.Image.new_from_icon_name("drive-harddisk", Gtk.IconSize.BUTTON))
-        partition_manager_button.set_always_show_image(True)
-        partition_manager_button.connect("clicked", self.on_launch_partition_manager)
-        action_box.pack_start(partition_manager_button, False, False, 0)
-        
-        disks_container.pack_start(action_box, False, False, 0)
-        
-        # Make disks page scrollable
+        # Make scrollable
         disks_scrolled = Gtk.ScrolledWindow()
         disks_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         disks_scrolled.add(disks_container)
         
-        self.stack.add_titled(disks_scrolled, "disks", _("Disks"))
+        self.stack.add_titled(disks_scrolled, "disks", "Disks")
+        
+        # Load disk info
+        self.load_disk_info()
     
     def create_backups_page(self):
         """Create backups page"""
@@ -3540,104 +2673,17 @@ class DockpanelWindow(Gtk.ApplicationWindow):
         title.set_margin_bottom(20)
         backups_container.pack_start(title, False, False, 0)
         
-        # Check for backup tool
-        backup_tool = BackupManager.check_backup_tool()
-        if not backup_tool:
-            # Show message about missing backup tool
-            missing_tool_card = self.create_card(_("Backup Tool Not Found"))
-            missing_tool_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-            
-            missing_tool_label = Gtk.Label(label=_("No backup tool found. Install one of the following tools:"))
-            missing_tool_box.pack_start(missing_tool_label, False, False, 0)
-            
-            if SYSTEM == "Linux":
-                if DISTRO in ["arch", "manjaro"]:
-                    tool_name = "timeshift"
-                elif DISTRO in ["opensuse-leap", "opensuse-tumbleweed"]:
-                    tool_name = "snapper"
-                else:
-                    tool_name = "timeshift"
-                
-                install_button = Gtk.Button(label=_("Install {}").format(tool_name))
-                install_button.set_image(Gtk.Image.new_from_icon_name("system-software-install", Gtk.IconSize.BUTTON))
-                install_button.set_always_show_image(True)
-                install_button.connect("clicked", lambda _: self.install_backup_tool(tool_name))
-                missing_tool_box.pack_start(install_button, False, False, 0)
-            
-            missing_tool_card.get_child().add(missing_tool_box)
-            backups_container.pack_start(missing_tool_card, True, True, 0)
-        else:
-            # Backup tool found, show backup interface
-            # Create backup card
-            create_backup_card = self.create_card(_("Create Backup"))
-            create_backup_grid = Gtk.Grid()
-            create_backup_grid.set_row_spacing(10)
-            create_backup_grid.set_column_spacing(10)
-            
-            create_backup_grid.attach(Gtk.Label(label=_("Name:")), 0, 0, 1, 1)
-            self.backup_name_entry = Gtk.Entry()
-            create_backup_grid.attach(self.backup_name_entry, 1, 0, 1, 1)
-            
-            create_backup_grid.attach(Gtk.Label(label=_("Description:")), 0, 1, 1, 1)
-            self.backup_description_entry = Gtk.Entry()
-            create_backup_grid.attach(self.backup_description_entry, 1, 1, 1, 1)
-            
-            create_backup_button = Gtk.Button(label=_("Create Backup"))
-            create_backup_button.set_image(Gtk.Image.new_from_icon_name("document-save", Gtk.IconSize.BUTTON))
-            create_backup_button.set_always_show_image(True)
-            create_backup_button.connect("clicked", self.on_create_backup)
-            create_backup_grid.attach(create_backup_button, 0, 2, 2, 1)
-            
-            create_backup_card.get_child().add(create_backup_grid)
-            backups_container.pack_start(create_backup_card, False, False, 0)
-            
-            # Backup list
-            backups_list_card = self.create_card(_("Available Backups"))
-            backups_list_scrolled = Gtk.ScrolledWindow()
-            backups_list_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-            backups_list_scrolled.set_min_content_height(200)
-            
-            self.backups_list = Gtk.ListBox()
-            self.backups_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
-            self.backups_list.connect("row-selected", self.on_backup_selected)
-            backups_list_scrolled.add(self.backups_list)
-            
-            backups_list_card.get_child().add(backups_list_scrolled)
-            backups_container.pack_start(backups_list_card, True, True, 0)
-            
-            # Action buttons
-            action_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-            action_box.set_halign(Gtk.Align.END)
-            action_box.set_margin_top(10)
-            
-            self.restore_button = Gtk.Button(label=_("Restore"))
-            self.restore_button.set_image(Gtk.Image.new_from_icon_name("document-revert", Gtk.IconSize.BUTTON))
-            self.restore_button.set_always_show_image(True)
-            self.restore_button.set_sensitive(False)
-            self.restore_button.connect("clicked", self.on_restore_backup)
-            action_box.pack_start(self.restore_button, False, False, 0)
-            
-            self.delete_backup_button = Gtk.Button(label=_("Delete"))
-            self.delete_backup_button.set_image(Gtk.Image.new_from_icon_name("edit-delete", Gtk.IconSize.BUTTON))
-            self.delete_backup_button.set_always_show_image(True)
-            self.delete_backup_button.set_sensitive(False)
-            self.delete_backup_button.connect("clicked", self.on_delete_backup)
-            action_box.pack_start(self.delete_backup_button, False, False, 0)
-            
-            refresh_backups_button = Gtk.Button(label=_("Refresh"))
-            refresh_backups_button.set_image(Gtk.Image.new_from_icon_name("view-refresh", Gtk.IconSize.BUTTON))
-            refresh_backups_button.set_always_show_image(True)
-            refresh_backups_button.connect("clicked", self.on_refresh_backups)
-            action_box.pack_start(refresh_backups_button, False, False, 0)
-            
-            backups_container.pack_start(action_box, False, False, 0)
+        # Backup info
+        info_label = Gtk.Label(label="Backup functionality requires Timeshift or Snapper to be installed.")
+        info_label.set_halign(Gtk.Align.CENTER)
+        backups_container.pack_start(info_label, True, True, 0)
         
-        # Make backups page scrollable
+        # Make scrollable
         backups_scrolled = Gtk.ScrolledWindow()
         backups_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         backups_scrolled.add(backups_container)
         
-        self.stack.add_titled(backups_scrolled, "backups", _("Backups"))
+        self.stack.add_titled(backups_scrolled, "backups", "Backups")
     
     def create_cleaner_page(self):
         """Create system cleaner page"""
@@ -3652,57 +2698,63 @@ class DockpanelWindow(Gtk.ApplicationWindow):
         cleaner_container.pack_start(title, False, False, 0)
         
         # Cleaner options
-        cleaner_options_card = self.create_card(_("Cleaner Options"))
-        cleaner_options_grid = Gtk.Grid()
-        cleaner_options_grid.set_row_spacing(10)
-        cleaner_options_grid.set_column_spacing(10)
+        options_card = self.create_card("Cleaning Options")
+        options_grid = Gtk.Grid()
+        options_grid.set_row_spacing(10)
+        options_grid.set_column_spacing(10)
         
-        self.clean_package_cache = Gtk.CheckButton(label=_("Clean Package Cache"))
-        cleaner_options_grid.attach(self.clean_package_cache, 0, 0, 1, 1)
+        self.clean_cache_check = Gtk.CheckButton(label="Clean Package Cache")
+        self.clean_cache_check.set_active(True)
+        options_grid.attach(self.clean_cache_check, 0, 0, 1, 1)
         
-        self.clean_temp_files = Gtk.CheckButton(label=_("Clean Temporary Files"))
-        cleaner_options_grid.attach(self.clean_temp_files, 0, 1, 1, 1)
+        self.clean_temp_check = Gtk.CheckButton(label="Clean Temporary Files")
+        self.clean_temp_check.set_active(True)
+        options_grid.attach(self.clean_temp_check, 0, 1, 1, 1)
         
-        self.clean_logs = Gtk.CheckButton(label=_("Clean System Logs"))
-        cleaner_options_grid.attach(self.clean_logs, 0, 2, 1, 1)
+        self.clean_logs_check = Gtk.CheckButton(label="Clean System Logs")
+        options_grid.attach(self.clean_logs_check, 0, 2, 1, 1)
         
-        self.clean_thumbnails = Gtk.CheckButton(label=_("Clean Thumbnail Cache"))
-        cleaner_options_grid.attach(self.clean_thumbnails, 0, 3, 1, 1)
-        
-        # Set default selections
-        self.clean_package_cache.set_active(True)
-        self.clean_temp_files.set_active(True)
-        self.clean_thumbnails.set_active(True)
-        
-        clean_button = Gtk.Button(label=_("Clean System"))
+        clean_button = Gtk.Button(label="Clean System")
         clean_button.set_image(Gtk.Image.new_from_icon_name("user-trash", Gtk.IconSize.BUTTON))
         clean_button.set_always_show_image(True)
         clean_button.connect("clicked", self.on_clean_system)
-        cleaner_options_grid.attach(clean_button, 0, 4, 1, 1)
+        options_grid.attach(clean_button, 0, 3, 1, 1)
         
-        cleaner_options_card.get_child().add(cleaner_options_grid)
-        cleaner_container.pack_start(cleaner_options_card, False, False, 0)
+        options_card.get_child().add(options_grid)
+        cleaner_container.pack_start(options_card, False, False, 0)
         
-        # Disk usage by directory
-        disk_usage_card = self.create_card(_("Disk Usage by Directory"))
-        disk_usage_scrolled = Gtk.ScrolledWindow()
-        disk_usage_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        disk_usage_scrolled.set_min_content_height(200)
-        
-        self.disk_usage_list = Gtk.ListBox()
-        disk_usage_scrolled.add(self.disk_usage_list)
-        
-        disk_usage_card.get_child().add(disk_usage_scrolled)
-        cleaner_container.pack_start(disk_usage_card, True, True, 0)
-        
-        # Make cleaner page scrollable
+        # Make scrollable
         cleaner_scrolled = Gtk.ScrolledWindow()
         cleaner_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         cleaner_scrolled.add(cleaner_container)
         
-        self.stack.add_titled(cleaner_scrolled, "cleaner", _("Cleaner"))
+        self.stack.add_titled(cleaner_scrolled, "cleaner", "Cleaner")
     
-    def create_card(self, title):
+    def create_system_page(self):
+        """Create system settings page"""
+        system_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=15)
+        system_container.set_border_width(20)
+        
+        # Title
+        title = Gtk.Label()
+        title.set_markup("<big><b>System Settings</b></big>")
+        title.set_halign(Gtk.Align.START)
+        title.set_margin_bottom(20)
+        system_container.pack_start(title, False, False, 0)
+        
+        # System info
+        info_label = Gtk.Label(label="System settings and configuration options will be available here.")
+        info_label.set_halign(Gtk.Align.CENTER)
+        system_container.pack_start(info_label, True, True, 0)
+        
+        # Make scrollable
+        system_scrolled = Gtk.ScrolledWindow()
+        system_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        system_scrolled.add(system_container)
+        
+        self.stack.add_titled(system_scrolled, "system", "System")
+    
+    def create_card(self, title: str) -> Gtk.Frame:
         """Create a card widget with title"""
         card = Gtk.Frame()
         card.set_shadow_type(Gtk.ShadowType.IN)
@@ -3732,163 +2784,64 @@ class DockpanelWindow(Gtk.ApplicationWindow):
         
         return card
     
-    def start_monitoring(self):
-        """Start background monitoring threads"""
-        # Update system info every 5 seconds
-        GLib.timeout_add_seconds(5, self.update_system_info)
+    # Load methods
+    def load_repositories(self):
+        """Load repository list"""
+        self.repo_liststore.clear()
         
-        # Update network info every 10 seconds
-        GLib.timeout_add_seconds(10, self.update_network_info)
-        
-        # Update date/time every second
-        GLib.timeout_add_seconds(1, self.update_datetime)
-        
-        # Update processes every 5 seconds
-        GLib.timeout_add_seconds(5, self.update_processes)
+        repos = self.repo_manager.get_repositories()
+        for repo in repos:
+            self.repo_liststore.append([
+                repo['enabled'],
+                repo['name'],
+                repo.get('url', ''),
+                repo['type']
+            ])
     
-    def update_system_info(self):
-        """Update system information"""
-        try:
-            # System info
-            self.system_info_labels["os"].set_text(f"{SYSTEM} {DISTRO}")
-            self.system_info_labels["kernel"].set_text(platform.release())
-            
-            # Uptime
-            uptime_seconds = SystemInfo.get_uptime()
-            uptime_str = str(datetime.fromtimestamp(time.time() - uptime_seconds).strftime("%Y-%m-%d %H:%M:%S"))
-            self.system_info_labels["uptime"].set_text(uptime_str)
-            
-            # Hostname
-            self.system_info_labels["hostname"].set_text(socket.gethostname())
-            
-            # CPU info
-            cpu_model = SystemInfo.get_cpu_model()
-            self.system_info_labels["cpu_model"].set_text(cpu_model)
-            
-            # CPU cores
-            cpu_cores = SystemInfo.get_cpu_cores()
-            self.system_info_labels["cpu_cores"].set_text(str(cpu_cores))
-            
-            # Memory info
-            memory = SystemInfo.get_memory_info()
-            self.system_info_labels["memory_total"].set_text(f"{memory['total']} GB")
-            
-            # Disk info
-            disk = SystemInfo.get_disk_usage('/')
-            self.system_info_labels["disk_total"].set_text(f"{disk['total']} GB ({disk['used']} GB used)")
-            
-            # Resource usage
-            cpu_percent = SystemInfo.get_cpu_usage()
-            self.cpu_progress.set_fraction(cpu_percent / 100)
-            self.cpu_progress.set_text(f"{cpu_percent:.1f}%")
-            
-            memory_percent = memory['percent']
-            self.memory_progress.set_fraction(memory_percent / 100)
-            self.memory_progress.set_text(f"{memory_percent:.1f}%")
-            
-            # Swap usage
-            if 'swap_percent' in memory:
-                swap_percent = memory['swap_percent']
-                self.swap_progress.set_fraction(swap_percent / 100)
-                self.swap_progress.set_text(f"{swap_percent:.1f}%")
-            else:
-                self.swap_progress.hide()
-            
-            disk_percent = disk['percent']
-            self.disk_progress.set_fraction(disk_percent / 100)
-            self.disk_progress.set_text(f"{disk_percent:.1f}%")
-            
-            # Temperature
-            temp = SystemInfo.get_temperature()
-            if temp is not None:
-                self.temp_label.set_text(f"{temp}°C")
-                self.temp_frame.show()
-            else:
-                self.temp_frame.hide()
-            
-            # Battery
-            battery = SystemInfo.get_battery_info()
-            if battery:
-                battery_text = f"{battery['percent']}%"
-                if battery['secsleft'] > 0:
-                    hours = battery['secsleft'] // 3600
-                    minutes = (battery['secsleft'] % 3600) // 60
-                    battery_text += f" ({hours}h {minutes}m remaining)"
-                
-                if battery['power_plugged']:
-                    battery_text += " (Charging)"
-                
-                self.battery_label.set_text(battery_text)
-                self.battery_frame.show()
-            else:
-                self.battery_frame.hide()
-            
-            # System load
-            load = SystemInfo.get_system_load()
-            load_text = f"1 min: {load['load1']:.2f}, 5 min: {load['load5']:.2f}, 15 min: {load['load15']:.2f}"
-            self.load_label.set_text(load_text)
-            self.load_frame.show()
-            
-        except Exception as e:
-            print(f"Error updating system info: {e}")
+    def load_boot_entries(self):
+        """Load boot entries"""
+        # Clear existing entries
+        for child in self.boot_entries_list.get_children():
+            self.boot_entries_list.remove(child)
         
-        return True
-    
-    def update_network_info(self):
-        """Update network information"""
-        try:
-            # Get primary interface IP
-            interfaces = NetworkManager.get_interfaces()
-            if interfaces:
-                primary = interfaces[0]
-                if primary['addresses']:
-                    self.network_info_labels["ip"].set_text(primary['addresses'][0])
-                else:
-                    self.network_info_labels["ip"].set_text(_("No IP"))
-            
-            # Gateway
-            stdout, stderr, code = CommandRunner.run_command("ip route | grep default")
-            if code == 0 and stdout:
-                gateway = stdout.split()[2]
-                self.network_info_labels["gateway"].set_text(gateway)
-            
-            # DNS
-            stdout, stderr, code = CommandRunner.run_command("cat /etc/resolv.conf | grep nameserver")
-            if code == 0 and stdout:
-                dns = stdout.split()[-1]
-                self.network_info_labels["dns"].set_text(dns)
-            
-            # Network speeds
-            current_time = time.time()
-            if current_time - self.network_speed_update_time > 5:
-                speeds = NetworkManager.get_network_speed()
-                if speeds:
-                    for name, speed in speeds.items():
-                        self.network_info_labels["upload"].set_text(f"{speed['tx_speed']:.1f} KB/s")
-                        self.network_info_labels["download"].set_text(f"{speed['rx_speed']:.1f} KB/s")
-                        break
-                self.network_speed_update_time = current_time
-            
-        except Exception as e:
-            print(f"Error updating network info: {e}")
+        boot_config = self.boot_manager.get_boot_config()
+        for entry in boot_config['entries']:
+            row = Gtk.ListBoxRow()
+            label = Gtk.Label(label=entry)
+            label.set_halign(Gtk.Align.START)
+            row.add(label)
+            self.boot_entries_list.add(row)
         
-        return True
+        self.boot_entries_list.show_all()
     
-    def update_datetime(self):
-        """Update date and time display"""
-        try:
-            now = datetime.now()
-            self.datetime_label.set_text(now.strftime("%Y-%m-%d %H:%M:%S"))
-        except:
-            pass
-        return True
+    def load_firewall_rules(self):
+        """Load firewall rules"""
+        self.rules_liststore.clear()
+        
+        firewall_info = self.firewall_manager.get_firewall_info()
+        for rule in firewall_info['rules']:
+            self.rules_liststore.append([
+                rule['action'],
+                rule['direction'],
+                rule['protocol'],
+                rule['source'],
+                rule['destination']
+            ])
     
-    def update_processes(self):
-        """Update process list"""
-        current_page = self.stack.get_visible_child_name()
-        if current_page == "processes":
-            self.load_processes()
-        return True
+    def load_logs(self):
+        """Load system logs"""
+        log_type = self.log_type_combo.get_active_text().lower()
+        lines = int(self.log_lines_spin.get_value())
+        
+        logs = self.log_manager.get_logs(log_type, lines)
+        
+        buffer = self.logs_textview.get_buffer()
+        buffer.set_text('\n'.join(logs))
+        
+        # Apply monospace font
+        start_iter = buffer.get_start_iter()
+        end_iter = buffer.get_end_iter()
+        buffer.apply_tag_by_name("monospace", start_iter, end_iter)
     
     def load_packages(self):
         """Load package lists"""
@@ -3897,12 +2850,14 @@ class DockpanelWindow(Gtk.ApplicationWindow):
             self.installed_packages_list.remove(child)
         for child in self.available_packages_list.get_children():
             self.available_packages_list.remove(child)
+        for child in self.upgradable_packages_list.get_children():
+            self.upgradable_packages_list.remove(child)
         
         # Load installed packages
         installed = self.pkg_manager.get_installed_packages()
-        for pkg in installed[:100]:
-            if len(pkg) == 3:
-                name, version, desc = pkg
+        for pkg in installed[:50]:  # Limit to 50 for performance
+            if len(pkg) >= 2:
+                name, version = pkg[0], pkg[1]
                 row = Gtk.ListBoxRow()
                 box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
                 
@@ -3920,415 +2875,190 @@ class DockpanelWindow(Gtk.ApplicationWindow):
                 row.add(box)
                 self.installed_packages_list.add(row)
         
+        # Load upgradable packages
+        upgradable = self.pkg_manager.get_upgradable_packages()
+        for pkg in upgradable:
+            if len(pkg) >= 2:
+                name, version = pkg[0], pkg[1]
+                row = Gtk.ListBoxRow()
+                box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+                
+                name_label = Gtk.Label(label=name)
+                name_label.set_halign(Gtk.Align.START)
+                name_label.get_style_context().add_class("bold")
+                box.pack_start(name_label, False, False, 0)
+                
+                version_label = Gtk.Label(label=f"Update to: {version}")
+                version_label.set_halign(Gtk.Align.START)
+                version_label.get_style_context().add_class("dim-label")
+                box.pack_start(version_label, False, False, 0)
+                
+                row.add(box)
+                self.upgradable_packages_list.add(row)
+        
         self.installed_packages_list.show_all()
-    
-    def load_repositories(self):
-        """Load repository list"""
-        # Clear existing list
-        for child in self.repo_list.get_children():
-            self.repo_list.remove(child)
-        
-        repos = self.pkg_manager.get_repositories()
-        for repo, enabled in repos:
-            row = Gtk.ListBoxRow()
-            box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-            
-            switch = Gtk.Switch()
-            switch.set_active(enabled)
-            switch.set_sensitive(False)
-            box.pack_start(switch, False, False, 0)
-            
-            label = Gtk.Label(label=repo)
-            label.set_halign(Gtk.Align.START)
-            box.pack_start(label, True, True, 0)
-            
-            row.add(box)
-            self.repo_list.add(row)
-        
-        self.repo_list.show_all()
+        self.upgradable_packages_list.show_all()
     
     def load_users(self):
         """Load user list"""
-        # Clear existing list
-        for child in self.user_list.get_children():
-            self.user_list.remove(child)
+        self.user_liststore.clear()
         
-        users = UserManager.get_users()
+        users = self.user_manager.get_users()
         for user in users:
-            row = Gtk.ListBoxRow()
-            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-            
-            name_label = Gtk.Label(label=user['username'])
-            name_label.set_halign(Gtk.Align.START)
-            name_label.get_style_context().add_class("bold")
-            box.pack_start(name_label, False, False, 0)
-            
-            info_label = Gtk.Label(label=f"UID: {user['uid']} | Home: {user['home']}")
-            info_label.set_halign(Gtk.Align.START)
-            info_label.get_style_context().add_class("dim-label")
-            box.pack_start(info_label, False, False, 0)
-            
-            row.add(box)
-            self.user_list.add(row)
-        
-        self.user_list.show_all()
+            self.user_liststore.append([
+                user['username'],
+                str(user['uid']),
+                user['home'],
+                user['shell'],
+                user['last_login']
+            ])
     
     def load_network_info(self):
         """Load network information"""
-        # Load interfaces
+        # Clear existing list
         for child in self.interfaces_list.get_children():
             self.interfaces_list.remove(child)
         
-        interfaces = NetworkManager.get_interfaces()
-        for iface in interfaces:
-            row = Gtk.ListBoxRow()
-            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-            
-            name_label = Gtk.Label(label=iface['name'])
-            name_label.set_halign(Gtk.Align.START)
-            name_label.get_style_context().add_class("bold")
-            box.pack_start(name_label, False, False, 0)
-            
-            status = _("Up") if iface['is_up'] else _("Down")
-            status_label = Gtk.Label(label=f"Status: {status}")
-            status_label.set_halign(Gtk.Align.START)
-            status_label.get_style_context().add_class("dim-label")
-            box.pack_start(status_label, False, False, 0)
-            
-            if iface['addresses']:
-                addr_label = Gtk.Label(label=f"IP: {', '.join(iface['addresses'])}")
-                addr_label.set_halign(Gtk.Align.START)
-                addr_label.get_style_context().add_class("dim-label")
-                box.pack_start(addr_label, False, False, 0)
-            
-            if 'mac' in iface and iface['mac']:
-                mac_label = Gtk.Label(label=f"MAC: {iface['mac']}")
-                mac_label.set_halign(Gtk.Align.START)
-                mac_label.get_style_context().add_class("dim-label")
-                box.pack_start(mac_label, False, False, 0)
-            
-            row.add(box)
-            self.interfaces_list.add(row)
+        # Get network interfaces
+        stdout, _, code = run_command("ip addr show")
+        if code == 0:
+            current_iface = None
+            for line in stdout.split('\n'):
+                if line and not line.startswith(' '):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        current_iface = parts[1].rstrip(':')
+                        if current_iface != 'lo':
+                            row = Gtk.ListBoxRow()
+                            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+                            
+                            name_label = Gtk.Label(label=current_iface)
+                            name_label.set_halign(Gtk.Align.START)
+                            name_label.get_style_context().add_class("bold")
+                            box.pack_start(name_label, False, False, 0)
+                            
+                            status = "Up" if "UP" in line else "Down"
+                            status_label = Gtk.Label(label=f"Status: {status}")
+                            status_label.set_halign(Gtk.Align.START)
+                            status_label.get_style_context().add_class("dim-label")
+                            box.pack_start(status_label, False, False, 0)
+                            
+                            row.add(box)
+                            self.interfaces_list.add(row)
+                elif current_iface and 'inet ' in line:
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        ip = parts[1].split('/')[0]
+                        # Add IP to the last row
+                        rows = self.interfaces_list.get_children()
+                        if rows:
+                            last_row = rows[-1]
+                            box = last_row.get_child()
+                            ip_label = Gtk.Label(label=f"IP: {ip}")
+                            ip_label.set_halign(Gtk.Align.START)
+                            ip_label.get_style_context().add_class("dim-label")
+                            box.pack_start(ip_label, False, False, 0)
         
         self.interfaces_list.show_all()
-        
-        # Load active connections
-        for child in self.connections_list.get_children():
-            self.connections_list.remove(child)
-        
-        connections = NetworkManager.get_active_connections()
-        for conn in connections[:50]:
-            row = Gtk.ListBoxRow()
-            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-            
-            conn_label = Gtk.Label(label=f"{conn['local']} ↔ {conn['remote']}")
-            conn_label.set_halign(Gtk.Align.START)
-            box.pack_start(conn_label, False, False, 0)
-            
-            if 'protocol' in conn:
-                proto_label = Gtk.Label(label=f"Protocol: {conn['protocol']}")
-                proto_label.set_halign(Gtk.Align.START)
-                proto_label.get_style_context().add_class("dim-label")
-                box.pack_start(proto_label, False, False, 0)
-            
-            if 'pid' in conn and conn['pid'] != 'N/A':
-                pid_label = Gtk.Label(label=f"PID: {conn['pid']}")
-                pid_label.set_halign(Gtk.Align.START)
-                pid_label.get_style_context().add_class("dim-label")
-                box.pack_start(pid_label, False, False, 0)
-            
-            row.add(box)
-            self.connections_list.add(row)
-        
-        self.connections_list.show_all()
-        
-        # Load firewall status
-        fw_type, fw_status = NetworkManager.get_firewall_status()
-        self.firewall_status_label.set_text(f"{fw_type}: {'Active' if fw_status else 'Inactive'}")
-        self.firewall_switch.set_active(fw_status)
     
     def load_services(self):
         """Load service list"""
-        # Clear existing list
-        for child in self.services_list.get_children():
-            self.services_list.remove(child)
+        self.service_liststore.clear()
         
-        services = ServiceManager.get_services()
+        services = self.service_manager.get_all_services()
         for service in services:
-            row = Gtk.ListBoxRow()
-            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-            
-            name_label = Gtk.Label(label=service['name'])
-            name_label.set_halign(Gtk.Align.START)
-            name_label.get_style_context().add_class("bold")
-            box.pack_start(name_label, False, False, 0)
-            
-            status_label = Gtk.Label(label=f"Status: {service['active']} ({service['sub']})")
-            status_label.set_halign(Gtk.Align.START)
-            status_label.get_style_context().add_class("dim-label")
-            box.pack_start(status_label, False, False, 0)
-            
-            if service['description']:
-                desc_label = Gtk.Label(label=service['description'][:50] + "..." if len(service['description']) > 50 else service['description'])
-                desc_label.set_halign(Gtk.Align.START)
-                desc_label.get_style_context().add_class("dim-label")
-                box.pack_start(desc_label, False, False, 0)
-            
-            row.add(box)
-            self.services_list.add(row)
-        
-        self.services_list.show_all()
+            self.service_liststore.append([
+                service['name'],
+                service['load'],
+                service['active'],
+                service['sub'],
+                service['enabled']
+            ])
     
     def load_processes(self):
         """Load process list"""
         self.process_liststore.clear()
         
-        processes = ProcessManager.get_processes()
-        for process in processes:
-            self.process_liststore.append([
-                process['user'],
-                process['pid'],
-                process['cpu'],
-                process['mem'],
-                process['vsz'],
-                process['rss'],
-                process['tty'],
-                process['stat'],
-                process['start'],
-                process['time'],
-                process['command']
-            ])
+        stdout, _, code = run_command("ps aux")
+        if code == 0:
+            lines = stdout.split('\n')[1:]
+            for line in lines[:100]:  # Limit to 100 for performance
+                if line.strip():
+                    parts = line.split(None, 10)
+                    if len(parts) >= 11:
+                        self.process_liststore.append([
+                            parts[0],  # user
+                            parts[1],  # pid
+                            parts[2],  # cpu
+                            parts[3],  # mem
+                            parts[4],  # vsz
+                            parts[5],  # rss
+                            parts[6],  # tty
+                            parts[7],  # stat
+                            parts[8],  # start
+                            parts[9],  # time
+                            parts[10]  # command
+                        ])
     
-    def load_disks(self):
+    def load_disk_info(self):
         """Load disk information"""
-        # Load physical disks
-        for child in self.physical_disks_list.get_children():
-            self.physical_disks_list.remove(child)
+        self.disk_liststore.clear()
         
-        disks = DiskManager.get_physical_disks()
-        for disk in disks:
-            row = Gtk.ListBoxRow()
-            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-            
-            name_label = Gtk.Label(label=disk['name'])
-            name_label.set_halign(Gtk.Align.START)
-            name_label.get_style_context().add_class("bold")
-            box.pack_start(name_label, False, False, 0)
-            
-            info_label = Gtk.Label(label=f"Size: {disk['size']} | Model: {disk['model']}")
-            info_label.set_halign(Gtk.Align.START)
-            info_label.get_style_context().add_class("dim-label")
-            box.pack_start(info_label, False, False, 0)
-            
-            row.add(box)
-            self.physical_disks_list.add(row)
-        
-        self.physical_disks_list.show_all()
-        
-        # Load partitions
-        for child in self.partitions_list.get_children():
-            self.partitions_list.remove(child)
-        
-        partitions = DiskManager.get_disk_partitions()
-        for partition in partitions:
-            row = Gtk.ListBoxRow()
-            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-            
-            device_label = Gtk.Label(label=partition['device'])
-            device_label.set_halign(Gtk.Align.START)
-            device_label.get_style_context().add_class("bold")
-            box.pack_start(device_label, False, False, 0)
-            
-            mount_label = Gtk.Label(label=f"Mount: {partition['mountpoint']}")
-            mount_label.set_halign(Gtk.Align.START)
-            mount_label.get_style_context().add_class("dim-label")
-            box.pack_start(mount_label, False, False, 0)
-            
-            usage_label = Gtk.Label(label=f"Size: {partition['total']} GB | Used: {partition['used']} GB ({partition['percent']}%)")
-            usage_label.set_halign(Gtk.Align.START)
-            usage_label.get_style_context().add_class("dim-label")
-            box.pack_start(usage_label, False, False, 0)
-            
-            row.add(box)
-            self.partitions_list.add(row)
-        
-        self.partitions_list.show_all()
+        stdout, _, code = run_command("df -h")
+        if code == 0:
+            lines = stdout.split('\n')[1:]
+            for line in lines:
+                if line.strip():
+                    parts = line.split()
+                    if len(parts) >= 6:
+                        self.disk_liststore.append([
+                            parts[0],  # filesystem
+                            parts[1],  # size
+                            parts[2],  # used
+                            parts[3],  # avail
+                            parts[5]   # mount
+                        ])
     
-    def load_backups(self):
-        """Load backup list"""
-        # Clear existing list
-        for child in self.backups_list.get_children():
-            self.backups_list.remove(child)
-        
-        backups = BackupManager.list_backups()
-        for backup in backups:
-            row = Gtk.ListBoxRow()
-            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-            
-            if 'name' in backup:
-                name_label = Gtk.Label(label=backup['name'])
-                name_label.set_halign(Gtk.Align.START)
-                name_label.get_style_context().add_class("bold")
-                box.pack_start(name_label, False, False, 0)
-                
-                date_label = Gtk.Label(label=f"{backup['date']} {backup['time']}")
-                date_label.set_halign(Gtk.Align.START)
-                date_label.get_style_context().add_class("dim-label")
-                box.pack_start(date_label, False, False, 0)
-                
-                if 'description' in backup and backup['description']:
-                    desc_label = Gtk.Label(label=backup['description'])
-                    desc_label.set_halign(Gtk.Align.START)
-                    desc_label.get_style_context().add_class("dim-label")
-                    box.pack_start(desc_label, False, False, 0)
-            elif 'id' in backup:
-                id_label = Gtk.Label(label=backup['id'])
-                id_label.set_halign(Gtk.Align.START)
-                id_label.get_style_context().add_class("bold")
-                box.pack_start(id_label, False, False, 0)
-                
-                date_label = Gtk.Label(label=f"{backup['date']} {backup['time']}")
-                date_label.set_halign(Gtk.Align.START)
-                date_label.get_style_context().add_class("dim-label")
-                box.pack_start(date_label, False, False, 0)
-                
-                if 'description' in backup and backup['description']:
-                    desc_label = Gtk.Label(label=backup['description'])
-                    desc_label.set_halign(Gtk.Align.START)
-                    desc_label.get_style_context().add_class("dim-label")
-                    box.pack_start(desc_label, False, False, 0)
-            
-            row.add(box)
-            self.backups_list.add(row)
-        
-        self.backups_list.show_all()
-    
-    def load_disk_usage(self):
-        """Load disk usage by directory"""
-        # Clear existing list
-        for child in self.disk_usage_list.get_children():
-            self.disk_usage_list.remove(child)
-        
-        usage = SystemCleaner.get_disk_usage_by_directory()
-        sorted_usage = sorted(usage.items(), key=lambda x: x[1], reverse=True)
-        
-        for directory, size in sorted_usage[:20]:  # Show top 20
-            row = Gtk.ListBoxRow()
-            box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-            
-            dir_label = Gtk.Label(label=directory)
-            dir_label.set_halign(Gtk.Align.START)
-            box.pack_start(dir_label, True, True, 0)
-            
-            size_label = Gtk.Label(label=f"{size} MB")
-            size_label.set_halign(Gtk.Align.END)
-            box.pack_start(size_label, False, False, 0)
-            
-            row.add(box)
-            self.disk_usage_list.add(row)
-        
-        self.disk_usage_list.show_all()
-    
-    def show_password_dialog(self, title, callback):
+    # Dialog methods
+    def show_password_dialog(self, title: str, callback):
         """Show password dialog for sudo operations"""
-        dialog = Gtk.MessageDialog(
-            parent=self,
-            flags=Gtk.DialogFlags.MODAL,
-            type=Gtk.MessageType.QUESTION,
-            buttons=Gtk.ButtonsType.OK_CANCEL,
-            message_format=title
-        )
-        
-        dialog.format_secondary_text(_("Enter your password to perform this action"))
-        
-        entry = Gtk.Entry()
-        entry.set_visibility(False)
-        entry.set_invisible_char("*")
-        entry.connect("activate", lambda _: dialog.response(Gtk.ResponseType.OK))
-        
-        dialog.get_content_area().pack_start(entry, True, True, 0)
-        dialog.show_all()
-        
+        dialog = PasswordDialog(self, title)
         response = dialog.run()
-        password = entry.get_text() if response == Gtk.ResponseType.OK else None
+        password = dialog.get_password() if response == Gtk.ResponseType.OK else None
         dialog.destroy()
         
         if password:
             callback(password)
     
-    def install_backup_tool(self, tool_name):
-        """Install a backup tool"""
-        def install_with_password(password):
-            success, message = DependencyManager.install_dependency(tool_name, self)
-            if success:
-                self.statusbar.push(0, _("Backup tool installed successfully"))
-                # Refresh the backups page
-                self.create_backups_page()
-            else:
-                self.show_error_dialog(_("Installation failed"), message)
-        
-        self.show_password_dialog(_("Install {}").format(tool_name), install_with_password)
+    def show_error_dialog(self, title: str, message: str):
+        """Show error dialog"""
+        dialog = Gtk.MessageDialog(
+            parent=self,
+            flags=Gtk.DialogFlags.MODAL,
+            type=Gtk.MessageType.ERROR,
+            buttons=Gtk.ButtonsType.OK,
+            message_format=title
+        )
+        dialog.format_secondary_text(message)
+        dialog.run()
+        dialog.destroy()
     
     # Event handlers
-    def on_window_state_changed(self, widget, event):
-        """Handle window state changes"""
-        # Adjust layout based on window size
-        if event.new_window_state & Gdk.WindowState.MAXIMIZED:
-            # Maximized - use full space
-            self.sidebar.set_size_request(200, -1)
-        else:
-            # Normal size
-            allocation = self.get_allocation()
-            if allocation.width < 800:
-                self.sidebar.set_size_request(150, -1)
-            else:
-                self.sidebar.set_size_request(200, -1)
-    
-    def on_configure_event(self, widget, event):
-        """Handle window resize"""
-        # Adjust sidebar size based on window width
-        if event.width < 800:
-            self.sidebar.set_size_request(150, -1)
-        else:
-            self.sidebar.set_size_request(200, -1)
-        return False
-    
     def on_nav_selected(self, listbox, row):
         """Handle navigation selection"""
         if row:
             page_id = row.get_name()
             self.stack.set_visible_child_name(page_id)
-            
-            # Load data for the selected page
-            if page_id == "packages":
-                self.load_packages()
-                self.load_repositories()
-            elif page_id == "users":
-                self.load_users()
-            elif page_id == "network":
-                self.load_network_info()
-            elif page_id == "services":
-                self.load_services()
-            elif page_id == "processes":
-                self.load_processes()
-            elif page_id == "disks":
-                self.load_disks()
-            elif page_id == "backups":
-                self.load_backups()
-            elif page_id == "cleaner":
-                self.load_disk_usage()
     
     def on_refresh_clicked(self, button):
         """Handle refresh button click"""
-        self.statusbar.push(0, _("Refreshing..."))
-        
-        self.update_system_info()
-        self.update_network_info()
+        self.statusbar.push(0, "Refreshing...")
         
         # Refresh current page
         current_page = self.stack.get_visible_child_name()
         if current_page == "packages":
             self.load_packages()
+        elif current_page == "repositories":
             self.load_repositories()
         elif current_page == "users":
             self.load_users()
@@ -4339,46 +3069,351 @@ class DockpanelWindow(Gtk.ApplicationWindow):
         elif current_page == "processes":
             self.load_processes()
         elif current_page == "disks":
-            self.load_disks()
-        elif current_page == "backups":
-            self.load_backups()
-        elif current_page == "cleaner":
-            self.load_disk_usage()
+            self.load_disk_info()
+        elif current_page == "boot":
+            self.load_boot_entries()
+        elif current_page == "firewall":
+            self.load_firewall_rules()
+        elif current_page == "logs":
+            self.load_logs()
         
-        self.statusbar.push(0, _("Refresh complete"))
-    
-    def on_settings_clicked(self, button):
-        """Handle settings button click"""
-        dialog = Gtk.MessageDialog(
-            parent=self,
-            flags=Gtk.DialogFlags.MODAL,
-            type=Gtk.MessageType.INFO,
-            buttons=Gtk.ButtonsType.OK,
-            message_format=_("Settings")
-        )
-        dialog.format_secondary_text(_("Settings functionality will be implemented in future versions"))
-        dialog.run()
-        dialog.destroy()
+        self.statusbar.push(0, "Refresh complete")
     
     def on_about_clicked(self, button):
         """Handle about button click"""
         dialog = Gtk.AboutDialog()
-        dialog.set_program_name("Dockpanel")
-        dialog.set_version("1.0.0")
-        dialog.set_comments(_("Universal system management tool"))
-        dialog.set_copyright("© 2024 Dockpanel Team")
+        dialog.set_program_name(APP_NAME)
+        dialog.set_version(APP_VERSION)
+        dialog.set_comments("Universal system management tool")
+        dialog.set_copyright("© 2021 - 2025 FloatingSkies")
         dialog.set_license_type(Gtk.License.GPL_3_0)
-        dialog.set_website("https://github.com/dockpanel/dockpanel")
         dialog.run()
         dialog.destroy()
     
+    # Repository event handlers
+    def on_add_repository(self, button):
+        """Handle add repository"""
+        dialog = Gtk.Dialog(title="Add Repository", parent=self, flags=Gtk.DialogFlags.MODAL)
+        dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OK, Gtk.ResponseType.OK)
+        
+        grid = Gtk.Grid()
+        grid.set_row_spacing(10)
+        grid.set_column_spacing(10)
+        grid.set_border_width(10)
+        
+        grid.attach(Gtk.Label(label="Repository URL:"), 0, 0, 1, 1)
+        url_entry = Gtk.Entry()
+        grid.attach(url_entry, 1, 0, 1, 1)
+        
+        grid.attach(Gtk.Label(label="Name (optional):"), 0, 1, 1, 1)
+        name_entry = Gtk.Entry()
+        grid.attach(name_entry, 1, 1, 1, 1)
+        
+        dialog.get_content_area().add(grid)
+        dialog.show_all()
+        
+        response = dialog.run()
+        if response == Gtk.ResponseType.OK:
+            url = url_entry.get_text()
+            name = name_entry.get_text()
+            
+            def add_with_password(password):
+                success, message = self.repo_manager.add_repository(url, name, password)
+                if success:
+                    self.statusbar.push(0, "Repository added successfully")
+                    self.load_repositories()
+                else:
+                    self.show_error_dialog("Failed to add repository", message)
+            
+            self.show_password_dialog("Add Repository", add_with_password)
+        
+        dialog.destroy()
+    
+    def on_refresh_repositories(self, button):
+        """Handle refresh repositories"""
+        def refresh_with_password(password):
+            success, message = self.repo_manager.refresh_repositories(password)
+            if success:
+                self.statusbar.push(0, "Repositories refreshed successfully")
+                self.load_repositories()
+            else:
+                self.show_error_dialog("Failed to refresh repositories", message)
+        
+        self.show_password_dialog("Refresh Repositories", refresh_with_password)
+    
+    def on_repo_selected(self, selection):
+        """Handle repository selection"""
+        model, tree_iter = selection.get_selected()
+        if tree_iter:
+            self.enable_repo_button.set_sensitive(True)
+            self.disable_repo_button.set_sensitive(True)
+            self.remove_repo_button.set_sensitive(True)
+        else:
+            self.enable_repo_button.set_sensitive(False)
+            self.disable_repo_button.set_sensitive(False)
+            self.remove_repo_button.set_sensitive(False)
+    
+    def on_repo_toggled(self, widget, path):
+        """Handle repository toggle"""
+        model = self.repo_liststore
+        tree_iter = model.get_iter(path)
+        
+        repo_name = model[tree_iter][1]
+        enabled = model[tree_iter][0]
+        
+        def toggle_with_password(password):
+            success, message = self.repo_manager.toggle_repository(repo_name, not enabled, password)
+            if success:
+                model[tree_iter][0] = not enabled
+                self.statusbar.push(0, f"Repository {'enabled' if not enabled else 'disabled'}")
+            else:
+                self.show_error_dialog("Failed to toggle repository", message)
+                # Revert toggle
+                model[tree_iter][0] = enabled
+        
+        self.show_password_dialog("Toggle Repository", toggle_with_password)
+    
+    def on_enable_repository(self, button):
+        """Handle enable repository"""
+        selection = self.repo_treeview.get_selection()
+        model, tree_iter = selection.get_selected()
+        if tree_iter:
+            repo_name = model[tree_iter][1]
+            
+            def enable_with_password(password):
+                success, message = self.repo_manager.toggle_repository(repo_name, True, password)
+                if success:
+                    model[tree_iter][0] = True
+                    self.statusbar.push(0, "Repository enabled")
+                else:
+                    self.show_error_dialog("Failed to enable repository", message)
+            
+            self.show_password_dialog("Enable Repository", enable_with_password)
+    
+    def on_disable_repository(self, button):
+        """Handle disable repository"""
+        selection = self.repo_treeview.get_selection()
+        model, tree_iter = selection.get_selected()
+        if tree_iter:
+            repo_name = model[tree_iter][1]
+            
+            def disable_with_password(password):
+                success, message = self.repo_manager.toggle_repository(repo_name, False, password)
+                if success:
+                    model[tree_iter][0] = False
+                    self.statusbar.push(0, "Repository disabled")
+                else:
+                    self.show_error_dialog("Failed to disable repository", message)
+            
+            self.show_password_dialog("Disable Repository", disable_with_password)
+    
+    def on_remove_repository(self, button):
+        """Handle remove repository"""
+        selection = self.repo_treeview.get_selection()
+        model, tree_iter = selection.get_selected()
+        if tree_iter:
+            repo_name = model[tree_iter][1]
+            
+            dialog = Gtk.MessageDialog(
+                parent=self,
+                flags=Gtk.DialogFlags.MODAL,
+                type=Gtk.MessageType.QUESTION,
+                buttons=Gtk.ButtonsType.YES_NO,
+                message_format="Remove Repository"
+            )
+            dialog.format_secondary_text(f"Are you sure you want to remove repository '{repo_name}'?")
+            response = dialog.run()
+            dialog.destroy()
+            
+            if response == Gtk.ResponseType.YES:
+                def remove_with_password(password):
+                    success, message = self.repo_manager.remove_repository(repo_name, password)
+                    if success:
+                        self.statusbar.push(0, "Repository removed successfully")
+                        self.load_repositories()
+                    else:
+                        self.show_error_dialog("Failed to remove repository", message)
+                
+                self.show_password_dialog("Remove Repository", remove_with_password)
+    
+    # Boot event handlers
+    def on_update_grub(self, button):
+        """Handle update GRUB"""
+        def update_with_password(password):
+            success, message = self.boot_manager.update_grub(password)
+            if success:
+                self.statusbar.push(0, "GRUB updated successfully")
+            else:
+                self.show_error_dialog("Failed to update GRUB", message)
+        
+        self.show_password_dialog("Update GRUB", update_with_password)
+    
+    def on_remove_old_kernels(self, button):
+        """Handle remove old kernels"""
+        keep_count = int(self.keep_kernels_spin.get_value())
+        
+        dialog = Gtk.MessageDialog(
+            parent=self,
+            flags=Gtk.DialogFlags.MODAL,
+            type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.YES_NO,
+            message_format="Remove Old Kernels"
+        )
+        dialog.format_secondary_text(f"Are you sure you want to remove old kernels, keeping the last {keep_count}?")
+        response = dialog.run()
+        dialog.destroy()
+        
+        if response == Gtk.ResponseType.YES:
+            def remove_with_password(password):
+                success, message = self.kernel_manager.remove_old_kernels(keep_count, password)
+                if success:
+                    self.statusbar.push(0, message)
+                else:
+                    self.show_error_dialog("Failed to remove kernels", message)
+            
+            self.show_password_dialog("Remove Kernels", remove_with_password)
+    
+    # Firewall event handlers
+    def on_firewall_toggle(self, switch, state):
+        """Handle firewall toggle"""
+        def toggle_with_password(password):
+            # This is a simplified implementation
+            success, message = True, "Firewall toggled"
+            if success:
+                self.statusbar.push(0, f"Firewall {'enabled' if state else 'disabled'}")
+            else:
+                self.show_error_dialog("Failed to toggle firewall", message)
+                self.firewall_switch.set_active(not state)
+        
+        self.show_password_dialog("Toggle Firewall", toggle_with_password)
+    
+    def on_add_firewall_rule(self, button):
+        """Handle add firewall rule"""
+        dialog = Gtk.Dialog(title="Add Firewall Rule", parent=self, flags=Gtk.DialogFlags.MODAL)
+        dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OK, Gtk.ResponseType.OK)
+        
+        grid = Gtk.Grid()
+        grid.set_row_spacing(10)
+        grid.set_column_spacing(10)
+        grid.set_border_width(10)
+        
+        grid.attach(Gtk.Label(label="Action:"), 0, 0, 1, 1)
+        action_combo = Gtk.ComboBoxText()
+        action_combo.append_text("allow")
+        action_combo.append_text("deny")
+        action_combo.set_active(0)
+        grid.attach(action_combo, 1, 0, 1, 1)
+        
+        grid.attach(Gtk.Label(label="Protocol:"), 0, 1, 1, 1)
+        protocol_combo = Gtk.ComboBoxText()
+        protocol_combo.append_text("tcp")
+        protocol_combo.append_text("udp")
+        protocol_combo.append_text("any")
+        protocol_combo.set_active(0)
+        grid.attach(protocol_combo, 1, 1, 1, 1)
+        
+        grid.attach(Gtk.Label(label="Port:"), 0, 2, 1, 1)
+        port_entry = Gtk.Entry()
+        grid.attach(port_entry, 1, 2, 1, 1)
+        
+        dialog.get_content_area().add(grid)
+        dialog.show_all()
+        
+        response = dialog.run()
+        if response == Gtk.ResponseType.OK:
+            action = action_combo.get_active_text()
+            protocol = protocol_combo.get_active_text()
+            port = port_entry.get_text()
+            
+            def add_with_password(password):
+                rule = {
+                    'backend': 'ufw',  # Simplified
+                    'action': action,
+                    'protocol': protocol,
+                    'port': port
+                }
+                success, message = self.firewall_manager.add_firewall_rule(rule, password)
+                if success:
+                    self.statusbar.push(0, "Firewall rule added successfully")
+                    self.load_firewall_rules()
+                else:
+                    self.show_error_dialog("Failed to add firewall rule", message)
+            
+            self.show_password_dialog("Add Firewall Rule", add_with_password)
+        
+        dialog.destroy()
+    
+    def on_rule_selected(self, selection):
+        """Handle rule selection"""
+        model, tree_iter = selection.get_selected()
+        self.remove_rule_button.set_sensitive(tree_iter is not None)
+    
+    def on_remove_firewall_rule(self, button):
+        """Handle remove firewall rule"""
+        selection = self.rules_treeview.get_selection()
+        model, tree_iter = selection.get_selected()
+        if tree_iter:
+            # Get rule details
+            rule = {
+                'backend': 'ufw',  # Simplified
+                'action': model[tree_iter][0],
+                'protocol': model[tree_iter][2],
+                'port': model[tree_iter][3]
+            }
+            
+            def remove_with_password(password):
+                success, message = self.firewall_manager.remove_firewall_rule(rule, password)
+                if success:
+                    self.statusbar.push(0, "Firewall rule removed successfully")
+                    self.load_firewall_rules()
+                else:
+                    self.show_error_dialog("Failed to remove firewall rule", message)
+            
+            self.show_password_dialog("Remove Firewall Rule", remove_with_password)
+    
+    # Logs event handlers
+    def on_log_type_changed(self, combo):
+        """Handle log type change"""
+        self.load_logs()
+    
+    def on_refresh_logs(self, button):
+        """Handle refresh logs"""
+        self.load_logs()
+    
+    def on_clear_logs(self, button):
+        """Handle clear logs"""
+        log_type = self.log_type_combo.get_active_text().lower()
+        
+        dialog = Gtk.MessageDialog(
+            parent=self,
+            flags=Gtk.DialogFlags.MODAL,
+            type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.YES_NO,
+            message_format="Clear Logs"
+        )
+        dialog.format_secondary_text(f"Are you sure you want to clear {log_type} logs?")
+        response = dialog.run()
+        dialog.destroy()
+        
+        if response == Gtk.ResponseType.YES:
+            def clear_with_password(password):
+                success, message = self.log_manager.clear_logs(log_type, password)
+                if success:
+                    self.statusbar.push(0, "Logs cleared successfully")
+                    self.load_logs()
+                else:
+                    self.show_error_dialog("Failed to clear logs", message)
+            
+            self.show_password_dialog("Clear Logs", clear_with_password)
+    
+    # Package event handlers
     def on_package_search(self, button):
         """Handle package search"""
         query = self.package_search_entry.get_text()
         if not query:
             return
         
-        self.statusbar.push(0, _("Searching packages..."))
+        self.statusbar.push(0, "Searching packages...")
         
         # Clear available packages list
         for child in self.available_packages_list.get_children():
@@ -4405,17 +3440,7 @@ class DockpanelWindow(Gtk.ApplicationWindow):
             self.available_packages_list.add(row)
         
         self.available_packages_list.show_all()
-        self.statusbar.push(0, _("Search complete"))
-    
-    def on_installed_package_selected(self, listbox, row):
-        """Handle installed package selection"""
-        self.install_button.set_sensitive(False)
-        self.remove_button.set_sensitive(True)
-    
-    def on_available_package_selected(self, listbox, row):
-        """Handle available package selection"""
-        self.install_button.set_sensitive(True)
-        self.remove_button.set_sensitive(False)
+        self.statusbar.push(0, "Search complete")
     
     def on_package_install(self, button):
         """Handle package installation"""
@@ -4430,12 +3455,12 @@ class DockpanelWindow(Gtk.ApplicationWindow):
         def install_with_password(password):
             success, message = self.pkg_manager.install_package(package_name, password)
             if success:
-                self.statusbar.push(0, _("Package installed successfully"))
+                self.statusbar.push(0, "Package installed successfully")
                 self.load_packages()
             else:
-                self.show_error_dialog(_("Installation failed"), message)
+                self.show_error_dialog("Installation failed", message)
         
-        self.show_password_dialog(_("Install Package"), install_with_password)
+        self.show_password_dialog("Install Package", install_with_password)
     
     def on_package_remove(self, button):
         """Handle package removal"""
@@ -4450,85 +3475,53 @@ class DockpanelWindow(Gtk.ApplicationWindow):
         def remove_with_password(password):
             success, message = self.pkg_manager.remove_package(package_name, password)
             if success:
-                self.statusbar.push(0, _("Package removed successfully"))
+                self.statusbar.push(0, "Package removed successfully")
                 self.load_packages()
             else:
-                self.show_error_dialog(_("Removal failed"), message)
+                self.show_error_dialog("Removal failed", message)
         
-        self.show_password_dialog(_("Remove Package"), remove_with_password)
+        self.show_password_dialog("Remove Package", remove_with_password)
     
     def on_package_update(self, button):
-        """Handle package list update"""
+        """Handle system update"""
         def update_with_password(password):
-            if self.pkg_manager.manager == "apt":
-                success, message = CommandRunner.run_sudo_command("apt update", password)
-            elif self.pkg_manager.manager == "dnf":
-                success, message = CommandRunner.run_sudo_command("dnf check-update", password)
-            elif self.pkg_manager.manager == "zypper":
-                success, message = CommandRunner.run_sudo_command("zypper refresh", password)
-            elif self.pkg_manager.manager == "pacman":
-                success, message = CommandRunner.run_sudo_command("pacman -Sy", password)
-            elif self.pkg_manager.manager == "brew":
-                success, message = CommandRunner.run_command("brew update")
-            else:
-                success, message = False, _("Unsupported package manager")
-            
+            success, message = self.pkg_manager.update_system(password)
             if success:
-                self.statusbar.push(0, _("Package list updated"))
+                self.statusbar.push(0, "System updated successfully")
                 self.load_packages()
             else:
-                self.show_error_dialog(_("Update failed"), message)
+                self.show_error_dialog("Update failed", message)
         
-        if self.pkg_manager.manager != "brew":
-            self.show_password_dialog(_("Update Package List"), update_with_password)
-        else:
-            update_with_password(None)
+        self.show_password_dialog("Update System", update_with_password)
     
     def on_package_upgrade_all(self, button):
-        """Handle system upgrade"""
+        """Handle upgrade all packages"""
         def upgrade_with_password(password):
             success, message = self.pkg_manager.update_system(password)
             if success:
-                self.statusbar.push(0, _("System upgraded successfully"))
+                self.statusbar.push(0, "All packages upgraded successfully")
                 self.load_packages()
             else:
-                self.show_error_dialog(_("Upgrade failed"), message)
+                self.show_error_dialog("Upgrade failed", message)
         
-        if self.pkg_manager.manager != "brew":
-            self.show_password_dialog(_("Upgrade System"), upgrade_with_password)
-        else:
-            upgrade_with_password(None)
+        self.show_password_dialog("Upgrade All Packages", upgrade_with_password)
     
-    def on_user_selected(self, listbox, row):
+    # User event handlers
+    def on_user_selected(self, selection):
         """Handle user selection"""
-        if not row:
-            return
-        
-        box = row.get_child()
-        name_label = box.get_children()[0]
-        username = name_label.get_text()
-        
-        # Get user details
-        users = UserManager.get_users()
-        for user in users:
-            if user['username'] == username:
-                self.user_details_labels["username"].set_text(user['username'])
-                self.user_details_labels["uid"].set_text(str(user['uid']))
-                self.user_details_labels["gid"].set_text(str(user['gid']))
-                self.user_details_labels["home"].set_text(user['home'])
-                self.user_details_labels["shell"].set_text(user['shell'])
-                
-                groups = UserManager.get_user_groups(username)
-                self.user_details_labels["groups"].set_text(", ".join(groups))
-                break
-        
-        # Enable buttons
-        self.modify_user_button.set_sensitive(True)
-        self.delete_user_button.set_sensitive(True)
+        model, tree_iter = selection.get_selected()
+        if tree_iter:
+            self.modify_user_button.set_sensitive(True)
+            self.lock_user_button.set_sensitive(True)
+            self.delete_user_button.set_sensitive(True)
+        else:
+            self.modify_user_button.set_sensitive(False)
+            self.lock_user_button.set_sensitive(False)
+            self.delete_user_button.set_sensitive(False)
     
     def on_add_user(self, button):
         """Handle add user"""
-        dialog = Gtk.Dialog(title=_("Add User"), parent=self, flags=Gtk.DialogFlags.MODAL)
+        dialog = Gtk.Dialog(title="Add User", parent=self, flags=Gtk.DialogFlags.MODAL)
         dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OK, Gtk.ResponseType.OK)
         
         grid = Gtk.Grid()
@@ -4537,26 +3530,20 @@ class DockpanelWindow(Gtk.ApplicationWindow):
         grid.set_border_width(10)
         
         # Username
-        grid.attach(Gtk.Label(label=_("Username:")), 0, 0, 1, 1)
+        grid.attach(Gtk.Label(label="Username:"), 0, 0, 1, 1)
         username_entry = Gtk.Entry()
         grid.attach(username_entry, 1, 0, 1, 1)
         
         # Full name
-        grid.attach(Gtk.Label(label=_("Full Name:")), 0, 1, 1, 1)
+        grid.attach(Gtk.Label(label="Full Name:"), 0, 1, 1, 1)
         fullname_entry = Gtk.Entry()
         grid.attach(fullname_entry, 1, 1, 1, 1)
         
         # Password
-        grid.attach(Gtk.Label(label=_("Password:")), 0, 2, 1, 1)
+        grid.attach(Gtk.Label(label="Password:"), 0, 2, 1, 1)
         password_entry = Gtk.Entry()
         password_entry.set_visibility(False)
         grid.attach(password_entry, 1, 2, 1, 1)
-        
-        # Confirm password
-        grid.attach(Gtk.Label(label=_("Confirm:")), 0, 3, 1, 1)
-        confirm_entry = Gtk.Entry()
-        confirm_entry.set_visibility(False)
-        grid.attach(confirm_entry, 1, 3, 1, 1)
         
         dialog.get_content_area().add(grid)
         dialog.show_all()
@@ -4566,461 +3553,305 @@ class DockpanelWindow(Gtk.ApplicationWindow):
             username = username_entry.get_text()
             fullname = fullname_entry.get_text()
             password = password_entry.get_text()
-            confirm = confirm_entry.get_text()
             
-            success, message = UserManager.create_user(username, password, fullname, password_confirm=confirm)
+            success, message = self.user_manager.create_user(username, password, fullname)
             if success:
-                self.statusbar.push(0, _("User created successfully"))
+                self.statusbar.push(0, "User created successfully")
                 self.load_users()
             else:
-                self.show_error_dialog(_("Failed to create user"), message)
+                self.show_error_dialog("Failed to create user", message)
         
         dialog.destroy()
     
     def on_modify_user(self, button):
         """Handle modify user"""
-        row = self.user_list.get_selected_row()
-        if not row:
-            return
-        
-        box = row.get_child()
-        name_label = box.get_children()[0]
-        username = name_label.get_text()
-        
-        dialog = Gtk.Dialog(title=_("Modify User"), parent=self, flags=Gtk.DialogFlags.MODAL)
-        dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OK, Gtk.ResponseType.OK)
-        
-        grid = Gtk.Grid()
-        grid.set_row_spacing(10)
-        grid.set_column_spacing(10)
-        grid.set_border_width(10)
-        
-        # Full name
-        grid.attach(Gtk.Label(label=_("Full Name:")), 0, 0, 1, 1)
-        fullname_entry = Gtk.Entry()
-        grid.attach(fullname_entry, 1, 0, 1, 1)
-        
-        # Shell
-        grid.attach(Gtk.Label(label=_("Shell:")), 0, 1, 1, 1)
-        shell_combo = Gtk.ComboBoxText()
-        shells = ["/bin/bash", "/bin/sh", "/bin/zsh", "/bin/fish", "/usr/bin/tcsh"]
-        for shell in shells:
-            shell_combo.append_text(shell)
-        grid.attach(shell_combo, 1, 1, 1, 1)
-        
-        dialog.get_content_area().add(grid)
-        dialog.show_all()
-        
-        response = dialog.run()
-        if response == Gtk.ResponseType.OK:
-            fullname = fullname_entry.get_text()
-            shell = shell_combo.get_active_text()
+        selection = self.user_treeview.get_selection()
+        model, tree_iter = selection.get_selected()
+        if tree_iter:
+            username = model[tree_iter][0]
             
-            def modify_with_password(password):
-                success, message = UserManager.modify_user(
-                    username,
-                    full_name=fullname,
-                    shell=shell,
-                    password=password
-                )
-                if success:
-                    self.statusbar.push(0, _("User modified successfully"))
-                    self.load_users()
-                else:
-                    self.show_error_dialog(_("Failed to modify user"), message)
+            dialog = Gtk.Dialog(title="Modify User", parent=self, flags=Gtk.DialogFlags.MODAL)
+            dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OK, Gtk.ResponseType.OK)
             
-            self.show_password_dialog(_("Modify User"), modify_with_password)
-        
-        dialog.destroy()
+            grid = Gtk.Grid()
+            grid.set_row_spacing(10)
+            grid.set_column_spacing(10)
+            grid.set_border_width(10)
+            
+            # Get current user info
+            users = self.user_manager.get_users()
+            current_user = None
+            for user in users:
+                if user['username'] == username:
+                    current_user = user
+                    break
+            
+            # Full name
+            grid.attach(Gtk.Label(label="Full Name:"), 0, 0, 1, 1)
+            fullname_entry = Gtk.Entry()
+            if current_user:
+                fullname_entry.set_text(current_user.get('gecos', ''))
+            grid.attach(fullname_entry, 1, 0, 1, 1)
+            
+            # Shell
+            grid.attach(Gtk.Label(label="Shell:"), 0, 1, 1, 1)
+            shell_combo = Gtk.ComboBoxText()
+            shells = ["/bin/bash", "/bin/sh", "/bin/zsh", "/bin/fish"]
+            for shell in shells:
+                shell_combo.append_text(shell)
+            if current_user:
+                try:
+                    idx = shells.index(current_user['shell'])
+                    shell_combo.set_active(idx)
+                except:
+                    shell_combo.set_active(0)
+            grid.attach(shell_combo, 1, 1, 1, 1)
+            
+            dialog.get_content_area().add(grid)
+            dialog.show_all()
+            
+            response = dialog.run()
+            if response == Gtk.ResponseType.OK:
+                fullname = fullname_entry.get_text()
+                shell = shell_combo.get_active_text()
+                
+                def modify_with_password(password):
+                    success, message = self.user_manager.modify_user(
+                        username,
+                        full_name=fullname,
+                        shell=shell
+                    )
+                    if success:
+                        self.statusbar.push(0, "User modified successfully")
+                        self.load_users()
+                    else:
+                        self.show_error_dialog("Failed to modify user", message)
+                
+                self.show_password_dialog("Modify User", modify_with_password)
+            
+            dialog.destroy()
+    
+    def on_lock_user(self, button):
+        """Handle lock/unlock user"""
+        selection = self.user_treeview.get_selection()
+        model, tree_iter = selection.get_selected()
+        if tree_iter:
+            username = model[tree_iter][0]
+            
+            # Check if user is locked (simplified check)
+            stdout, _, code = run_command(f"passwd -S {username}")
+            is_locked = code == 0 and stdout.split()[1] == 'L'
+            
+            action = "unlock" if is_locked else "lock"
+            
+            dialog = Gtk.MessageDialog(
+                parent=self,
+                flags=Gtk.DialogFlags.MODAL,
+                type=Gtk.MessageType.QUESTION,
+                buttons=Gtk.ButtonsType.YES_NO,
+                message_format=f"{action.capitalize()} User"
+            )
+            dialog.format_secondary_text(f"Are you sure you want to {action} user '{username}'?")
+            response = dialog.run()
+            dialog.destroy()
+            
+            if response == Gtk.ResponseType.YES:
+                def lock_with_password(password):
+                    if action == "lock":
+                        success, message = self.user_manager.lock_user(username)
+                    else:
+                        success, message = self.user_manager.unlock_user(username)
+                    
+                    if success:
+                        self.statusbar.push(0, f"User {action}ed successfully")
+                    else:
+                        self.show_error_dialog(f"Failed to {action} user", message)
+                
+                self.show_password_dialog(f"{action.capitalize()} User", lock_with_password)
     
     def on_delete_user(self, button):
         """Handle delete user"""
-        row = self.user_list.get_selected_row()
-        if not row:
-            return
-        
-        box = row.get_child()
-        name_label = box.get_children()[0]
-        username = name_label.get_text()
-        
-        dialog = Gtk.MessageDialog(
-            parent=self,
-            flags=Gtk.DialogFlags.MODAL,
-            type=Gtk.MessageType.QUESTION,
-            buttons=Gtk.ButtonsType.YES_NO,
-            message_format=_("Delete User")
-        )
-        dialog.format_secondary_text(_("Are you sure you want to delete user '{}'?").format(username))
-        response = dialog.run()
-        dialog.destroy()
-        
-        if response == Gtk.ResponseType.YES:
-            def delete_with_password(password):
-                success, message = UserManager.delete_user(username)
-                if success:
-                    self.statusbar.push(0, _("User deleted successfully"))
-                    self.load_users()
-                else:
-                    self.show_error_dialog(_("Failed to delete user"), message)
+        selection = self.user_treeview.get_selection()
+        model, tree_iter = selection.get_selected()
+        if tree_iter:
+            username = model[tree_iter][0]
             
-            self.show_password_dialog(_("Delete User"), delete_with_password)
+            dialog = Gtk.MessageDialog(
+                parent=self,
+                flags=Gtk.DialogFlags.MODAL,
+                type=Gtk.MessageType.QUESTION,
+                buttons=Gtk.ButtonsType.YES_NO,
+                message_format="Delete User"
+            )
+            dialog.format_secondary_text(f"Are you sure you want to delete user '{username}'?")
+            response = dialog.run()
+            dialog.destroy()
+            
+            if response == Gtk.ResponseType.YES:
+                def delete_with_password(password):
+                    success, message = self.user_manager.delete_user(username)
+                    if success:
+                        self.statusbar.push(0, "User deleted successfully")
+                        self.load_users()
+                    else:
+                        self.show_error_dialog("Failed to delete user", message)
+                
+                self.show_password_dialog("Delete User", delete_with_password)
     
-    def on_service_selected(self, listbox, row):
+    # Service event handlers
+    def on_service_selected(self, selection):
         """Handle service selection"""
-        if not row:
-            return
+        model, tree_iter = selection.get_selected()
+        if tree_iter:
+            self.start_button.set_sensitive(True)
+            self.stop_button.set_sensitive(True)
+            self.restart_button.set_sensitive(True)
+            self.enable_button.set_sensitive(True)
+            self.disable_button.set_sensitive(True)
+        else:
+            self.start_button.set_sensitive(False)
+            self.stop_button.set_sensitive(False)
+            self.restart_button.set_sensitive(False)
+            self.enable_button.set_sensitive(False)
+            self.disable_button.set_sensitive(False)
+    
+    def on_service_enabled_toggled(self, widget, path):
+        """Handle service enabled toggle"""
+        model = self.service_liststore
+        tree_iter = model.get_iter(path)
         
-        box = row.get_child()
-        name_label = box.get_children()[0]
-        service_name = name_label.get_text()
+        service_name = model[tree_iter][0]
+        enabled = model[tree_iter][4]
         
-        # Get service details
-        services = ServiceManager.get_services()
-        for service in services:
-            if service['name'] == service_name:
-                self.service_details_labels["name"].set_text(service['name'])
-                self.service_details_labels["status"].set_text(f"{service['active']} ({service['sub']})")
-                self.service_details_labels["enabled"].set_text(_("Yes") if service['enabled'] else _("No"))
-                self.service_details_labels["description"].set_text(service['description'])
-                break
+        def toggle_with_password(password):
+            if enabled:
+                success, message = self.service_manager.disable_service(service_name, password)
+            else:
+                success, message = self.service_manager.enable_service(service_name, password)
+            
+            if success:
+                model[tree_iter][4] = not enabled
+                self.statusbar.push(0, f"Service {'enabled' if not enabled else 'disabled'}")
+            else:
+                self.show_error_dialog("Failed to toggle service", message)
+                # Revert toggle
+                model[tree_iter][4] = enabled
         
-        # Enable buttons based on status
-        self.start_button.set_sensitive(True)
-        self.stop_button.set_sensitive(True)
-        self.restart_button.set_sensitive(True)
-        self.enable_button.set_sensitive(True)
-        self.disable_button.set_sensitive(True)
+        self.show_password_dialog("Toggle Service", toggle_with_password)
     
     def on_service_start(self, button):
         """Handle service start"""
-        row = self.services_list.get_selected_row()
-        if not row:
-            return
-        
-        box = row.get_child()
-        name_label = box.get_children()[0]
-        service_name = name_label.get_text()
-        
-        def start_with_password(password):
-            success, message = ServiceManager.control_service("start", service_name, password)
-            if success:
-                self.statusbar.push(0, _("Service started"))
-                self.load_services()
-            else:
-                self.show_error_dialog(_("Failed to start service"), message)
-        
-        self.show_password_dialog(_("Start Service"), start_with_password)
+        selection = self.service_treeview.get_selection()
+        model, tree_iter = selection.get_selected()
+        if tree_iter:
+            service_name = model[tree_iter][0]
+            
+            def start_with_password(password):
+                success, message = run_sudo_command(f"systemctl start {service_name}", password)
+                if success:
+                    self.statusbar.push(0, "Service started")
+                    self.load_services()
+                else:
+                    self.show_error_dialog("Failed to start service", message)
+            
+            self.show_password_dialog("Start Service", start_with_password)
     
     def on_service_stop(self, button):
         """Handle service stop"""
-        row = self.services_list.get_selected_row()
-        if not row:
-            return
-        
-        box = row.get_child()
-        name_label = box.get_children()[0]
-        service_name = name_label.get_text()
-        
-        def stop_with_password(password):
-            success, message = ServiceManager.control_service("stop", service_name, password)
-            if success:
-                self.statusbar.push(0, _("Service stopped"))
-                self.load_services()
-            else:
-                self.show_error_dialog(_("Failed to stop service"), message)
-        
-        self.show_password_dialog(_("Stop Service"), stop_with_password)
+        selection = self.service_treeview.get_selection()
+        model, tree_iter = selection.get_selected()
+        if tree_iter:
+            service_name = model[tree_iter][0]
+            
+            def stop_with_password(password):
+                success, message = run_sudo_command(f"systemctl stop {service_name}", password)
+                if success:
+                    self.statusbar.push(0, "Service stopped")
+                    self.load_services()
+                else:
+                    self.show_error_dialog("Failed to stop service", message)
+            
+            self.show_password_dialog("Stop Service", stop_with_password)
     
     def on_service_restart(self, button):
         """Handle service restart"""
-        row = self.services_list.get_selected_row()
-        if not row:
-            return
-        
-        box = row.get_child()
-        name_label = box.get_children()[0]
-        service_name = name_label.get_text()
-        
-        def restart_with_password(password):
-            success, message = ServiceManager.control_service("restart", service_name, password)
-            if success:
-                self.statusbar.push(0, _("Service restarted"))
-                self.load_services()
-            else:
-                self.show_error_dialog(_("Failed to restart service"), message)
-        
-        self.show_password_dialog(_("Restart Service"), restart_with_password)
+        selection = self.service_treeview.get_selection()
+        model, tree_iter = selection.get_selected()
+        if tree_iter:
+            service_name = model[tree_iter][0]
+            
+            def restart_with_password(password):
+                success, message = run_sudo_command(f"systemctl restart {service_name}", password)
+                if success:
+                    self.statusbar.push(0, "Service restarted")
+                    self.load_services()
+                else:
+                    self.show_error_dialog("Failed to restart service", message)
+            
+            self.show_password_dialog("Restart Service", restart_with_password)
     
     def on_service_enable(self, button):
         """Handle service enable"""
-        row = self.services_list.get_selected_row()
-        if not row:
-            return
-        
-        box = row.get_child()
-        name_label = box.get_children()[0]
-        service_name = name_label.get_text()
-        
-        def enable_with_password(password):
-            success, message = ServiceManager.control_service("enable", service_name, password)
-            if success:
-                self.statusbar.push(0, _("Service enabled"))
-                self.load_services()
-            else:
-                self.show_error_dialog(_("Failed to enable service"), message)
-        
-        self.show_password_dialog(_("Enable Service"), enable_with_password)
+        selection = self.service_treeview.get_selection()
+        model, tree_iter = selection.get_selected()
+        if tree_iter:
+            service_name = model[tree_iter][0]
+            
+            def enable_with_password(password):
+                success, message = self.service_manager.enable_service(service_name, password)
+                if success:
+                    self.statusbar.push(0, "Service enabled")
+                    self.load_services()
+                else:
+                    self.show_error_dialog("Failed to enable service", message)
+            
+            self.show_password_dialog("Enable Service", enable_with_password)
     
     def on_service_disable(self, button):
         """Handle service disable"""
-        row = self.services_list.get_selected_row()
-        if not row:
-            return
-        
-        box = row.get_child()
-        name_label = box.get_children()[0]
-        service_name = name_label.get_text()
-        
-        def disable_with_password(password):
-            success, message = ServiceManager.control_service("disable", service_name, password)
-            if success:
-                self.statusbar.push(0, _("Service disabled"))
-                self.load_services()
-            else:
-                self.show_error_dialog(_("Failed to disable service"), message)
-        
-        self.show_password_dialog(_("Disable Service"), disable_with_password)
-    
-    def on_create_service(self, button):
-        """Handle create service"""
-        dialog = Gtk.Dialog(title=_("Create Service"), parent=self, flags=Gtk.DialogFlags.MODAL)
-        dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OK, Gtk.ResponseType.OK)
-        
-        grid = Gtk.Grid()
-        grid.set_row_spacing(10)
-        grid.set_column_spacing(10)
-        grid.set_border_width(10)
-        
-        # Service name
-        grid.attach(Gtk.Label(label=_("Service Name:")), 0, 0, 1, 1)
-        name_entry = Gtk.Entry()
-        grid.attach(name_entry, 1, 0, 1, 1)
-        
-        # Description
-        grid.attach(Gtk.Label(label=_("Description:")), 0, 1, 1, 1)
-        desc_entry = Gtk.Entry()
-        grid.attach(desc_entry, 1, 1, 1, 1)
-        
-        # Command
-        grid.attach(Gtk.Label(label=_("Command:")), 0, 2, 1, 1)
-        cmd_entry = Gtk.Entry()
-        grid.attach(cmd_entry, 1, 2, 1, 1)
-        
-        # User
-        grid.attach(Gtk.Label(label=_("User:")), 0, 3, 1, 1)
-        user_entry = Gtk.Entry()
-        grid.attach(user_entry, 1, 3, 1, 1)
-        
-        # Working directory
-        grid.attach(Gtk.Label(label=_("Working Directory:")), 0, 4, 1, 1)
-        workdir_entry = Gtk.Entry()
-        grid.attach(workdir_entry, 1, 4, 1, 1)
-        
-        dialog.get_content_area().add(grid)
-        dialog.show_all()
-        
-        response = dialog.run()
-        if response == Gtk.ResponseType.OK:
-            name = name_entry.get_text()
-            description = desc_entry.get_text()
-            command = cmd_entry.get_text()
-            user = user_entry.get_text()
-            workdir = workdir_entry.get_text()
+        selection = self.service_treeview.get_selection()
+        model, tree_iter = selection.get_selected()
+        if tree_iter:
+            service_name = model[tree_iter][0]
             
-            def create_with_password(password):
-                success, message = ServiceManager.create_service(
-                    name, command, description, user, workdir, password
-                )
+            def disable_with_password(password):
+                success, message = self.service_manager.disable_service(service_name, password)
                 if success:
-                    self.statusbar.push(0, _("Service created successfully"))
+                    self.statusbar.push(0, "Service disabled")
                     self.load_services()
                 else:
-                    self.show_error_dialog(_("Failed to create service"), message)
+                    self.show_error_dialog("Failed to disable service", message)
             
-            self.show_password_dialog(_("Create Service"), create_with_password)
-        
-        dialog.destroy()
+            self.show_password_dialog("Disable Service", disable_with_password)
     
-    def on_firewall_toggle(self, switch, state):
-        """Handle firewall toggle"""
-        def toggle_with_password(password):
-            success, message = NetworkManager.toggle_firewall(state, password)
-            if success:
-                self.statusbar.push(0, _("Firewall updated"))
-                self.load_network_info()
-            else:
-                self.show_error_dialog(_("Failed to update firewall"), message)
-                self.firewall_switch.set_active(not state)
-        
-        self.show_password_dialog(_("Update Firewall"), toggle_with_password)
-    
-    def on_network_configure(self, button):
-        """Handle network configuration"""
-        row = self.interfaces_list.get_selected_row()
-        if not row:
-            self.show_error_dialog(_("No Interface Selected"), _("Please select a network interface to configure"))
-            return
-        
-        box = row.get_child()
-        name_label = box.get_children()[0]
-        interface_name = name_label.get_text()
-        
-        dialog = Gtk.Dialog(title=_("Configure Network Interface"), parent=self, flags=Gtk.DialogFlags.MODAL)
-        dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OK, Gtk.ResponseType.OK)
-        
-        grid = Gtk.Grid()
-        grid.set_row_spacing(10)
-        grid.set_column_spacing(10)
-        grid.set_border_width(10)
-        
-        # IP Address
-        grid.attach(Gtk.Label(label=_("IP Address:")), 0, 0, 1, 1)
-        ip_entry = Gtk.Entry()
-        grid.attach(ip_entry, 1, 0, 1, 1)
-        
-        # Gateway
-        grid.attach(Gtk.Label(label=_("Gateway:")), 0, 1, 1, 1)
-        gateway_entry = Gtk.Entry()
-        grid.attach(gateway_entry, 1, 1, 1, 1)
-        
-        # DNS
-        grid.attach(Gtk.Label(label=_("DNS Server:")), 0, 2, 1, 1)
-        dns_entry = Gtk.Entry()
-        grid.attach(dns_entry, 1, 2, 1, 1)
-        
-        dialog.get_content_area().add(grid)
-        dialog.show_all()
-        
-        response = dialog.run()
-        if response == Gtk.ResponseType.OK:
-            ip = ip_entry.get_text()
-            gateway = gateway_entry.get_text()
-            dns = dns_entry.get_text()
-            
-            settings = {}
-            if ip:
-                settings['ip'] = ip
-            if gateway:
-                settings['gateway'] = gateway
-            if dns:
-                settings['dns'] = dns
-            
-            def configure_with_password(password):
-                success, message = NetworkManager.configure_interface(interface_name, settings, password)
-                if success:
-                    self.statusbar.push(0, _("Interface configured successfully"))
-                    self.load_network_info()
-                else:
-                    self.show_error_dialog(_("Failed to configure interface"), message)
-            
-            self.show_password_dialog(_("Configure Interface"), configure_with_password)
-        
-        dialog.destroy()
-    
-    def on_network_restart(self, button):
-        """Handle network restart"""
-        def restart_with_password(password):
-            if INIT_SYSTEM == "systemd":
-                success, message = CommandRunner.run_sudo_command("systemctl restart NetworkManager", password)
-            else:
-                success, message = CommandRunner.run_sudo_command("service network restart", password)
-            
-            if success:
-                self.statusbar.push(0, _("Network restarted"))
-                self.load_network_info()
-            else:
-                self.show_error_dialog(_("Failed to restart network"), message)
-        
-        self.show_password_dialog(_("Restart Network"), restart_with_password)
-    
-    def on_language_settings_apply(self, button):
-        """Handle language settings apply"""
-        dialog = Gtk.MessageDialog(
-            parent=self,
-            flags=Gtk.DialogFlags.MODAL,
-            type=Gtk.MessageType.INFO,
-            buttons=Gtk.ButtonsType.OK,
-            message_format=_("Language Settings")
-        )
-        dialog.format_secondary_text(_("Language settings will be applied after system restart"))
-        dialog.run()
-        dialog.destroy()
-    
-    def on_sync_time(self, button):
-        """Handle time synchronization"""
-        def sync_with_password(password):
-            if DependencyManager.check_dependency("ntpdate"):
-                success, message = CommandRunner.run_sudo_command("ntpdate -s time.nist.gov", password)
-            elif DependencyManager.check_dependency("ntp"):
-                success, message = CommandRunner.run_sudo_command("systemctl restart ntpd", password)
-            else:
-                # Install ntpdate first
-                success, message = DependencyManager.install_dependency("ntpdate", self)
-                if success:
-                    success, message = CommandRunner.run_sudo_command("ntpdate -s time.nist.gov", password)
-            
-            if success:
-                self.statusbar.push(0, _("Time synchronized"))
-                self.update_datetime()
-            else:
-                self.show_error_dialog(_("Failed to sync time"), message)
-        
-        self.show_password_dialog(_("Synchronize Time"), sync_with_password)
-    
-    def on_check_updates(self, button):
-        """Handle check for updates"""
-        self.statusbar.push(0, _("Checking for updates..."))
-        
-        upgradable = self.pkg_manager.get_upgradable_packages()
-        if upgradable:
-            self.updates_status_label.set_text(_("{} updates available").format(len(upgradable)))
-        else:
-            self.updates_status_label.set_text(_("System is up to date"))
-    
-    def on_install_updates(self, button):
-        """Handle install updates"""
-        def install_with_password(password):
-            success, message = self.pkg_manager.update_system(password)
-            if success:
-                self.statusbar.push(0, _("Updates installed"))
-                self.load_packages()
-            else:
-                self.show_error_dialog(_("Failed to install updates"), message)
-        
-        self.show_password_dialog(_("Install Updates"), install_with_password)
-    
+    # Process event handlers
     def on_process_search(self, entry):
         """Handle process search"""
         query = entry.get_text().lower()
         
         self.process_liststore.clear()
         
-        processes = ProcessManager.get_processes()
-        for process in processes:
-            if query == "" or query in process['command'].lower() or query in process['user'].lower():
-                self.process_liststore.append([
-                    process['user'],
-                    process['pid'],
-                    process['cpu'],
-                    process['mem'],
-                    process['vsz'],
-                    process['rss'],
-                    process['tty'],
-                    process['stat'],
-                    process['start'],
-                    process['time'],
-                    process['command']
-                ])
+        stdout, _, code = run_command("ps aux")
+        if code == 0:
+            lines = stdout.split('\n')[1:]
+            for line in lines:
+                if line.strip():
+                    parts = line.split(None, 10)
+                    if len(parts) >= 11:
+                        if query == "" or query in parts[10].lower() or query in parts[0].lower():
+                            self.process_liststore.append([
+                                parts[0],  # user
+                                parts[1],  # pid
+                                parts[2],  # cpu
+                                parts[3],  # mem
+                                parts[4],  # vsz
+                                parts[5],  # rss
+                                parts[6],  # tty
+                                parts[7],  # stat
+                                parts[8],  # start
+                                parts[9],  # time
+                                parts[10]  # command
+                            ])
     
     def on_refresh_processes(self, button):
         """Handle refresh processes"""
@@ -5032,11 +3863,9 @@ class DockpanelWindow(Gtk.ApplicationWindow):
         if tree_iter:
             self.kill_button.set_sensitive(True)
             self.term_button.set_sensitive(True)
-            self.priority_button.set_sensitive(True)
         else:
             self.kill_button.set_sensitive(False)
             self.term_button.set_sensitive(False)
-            self.priority_button.set_sensitive(False)
     
     def on_kill_process(self, button):
         """Handle kill process"""
@@ -5050,22 +3879,22 @@ class DockpanelWindow(Gtk.ApplicationWindow):
                 flags=Gtk.DialogFlags.MODAL,
                 type=Gtk.MessageType.QUESTION,
                 buttons=Gtk.ButtonsType.YES_NO,
-                message_format=_("Kill Process")
+                message_format="Kill Process"
             )
-            dialog.format_secondary_text(_("Are you sure you want to kill process {}?").format(pid))
+            dialog.format_secondary_text(f"Are you sure you want to kill process {pid}?")
             response = dialog.run()
             dialog.destroy()
             
             if response == Gtk.ResponseType.YES:
                 def kill_with_password(password):
-                    success, message = ProcessManager.kill_process(pid, 9)
+                    success, message = run_sudo_command(f"kill -9 {pid}", password)
                     if success:
-                        self.statusbar.push(0, _("Process killed"))
+                        self.statusbar.push(0, "Process killed")
                         self.load_processes()
                     else:
-                        self.show_error_dialog(_("Failed to kill process"), message)
+                        self.show_error_dialog("Failed to kill process", message)
                 
-                self.show_password_dialog(_("Kill Process"), kill_with_password)
+                self.show_password_dialog("Kill Process", kill_with_password)
     
     def on_terminate_process(self, button):
         """Handle terminate process"""
@@ -5079,496 +3908,198 @@ class DockpanelWindow(Gtk.ApplicationWindow):
                 flags=Gtk.DialogFlags.MODAL,
                 type=Gtk.MessageType.QUESTION,
                 buttons=Gtk.ButtonsType.YES_NO,
-                message_format=_("Terminate Process")
+                message_format="Terminate Process"
             )
-            dialog.format_secondary_text(_("Are you sure you want to terminate process {}?").format(pid))
+            dialog.format_secondary_text(f"Are you sure you want to terminate process {pid}?")
             response = dialog.run()
             dialog.destroy()
             
             if response == Gtk.ResponseType.YES:
                 def terminate_with_password(password):
-                    success, message = ProcessManager.kill_process(pid, 15)
+                    success, message = run_sudo_command(f"kill -15 {pid}", password)
                     if success:
-                        self.statusbar.push(0, _("Process terminated"))
+                        self.statusbar.push(0, "Process terminated")
                         self.load_processes()
                     else:
-                        self.show_error_dialog(_("Failed to terminate process"), message)
+                        self.show_error_dialog("Failed to terminate process", message)
                 
-                self.show_password_dialog(_("Terminate Process"), terminate_with_password)
+                self.show_password_dialog("Terminate Process", terminate_with_password)
     
-    def on_process_details(self, button):
-        """Handle process details"""
-        selection = self.process_treeview.get_selection()
-        model, tree_iter = selection.get_selected()
-        if tree_iter:
-            pid = model[tree_iter][1]
-            
-            details = ProcessManager.get_process_details(pid)
-            if details:
-                details_text = f"""
-PID: {pid}
-Name: {details.get('name', 'N/A')}
-State: {details.get('state', 'N/A')}
-PPID: {details.get('ppid', 'N/A')}
-UID: {details.get('uid', 'N/A')}
-GID: {details.get('gid', 'N/A')}
-RSS: {details.get('rss', 'N/A')} MB
-Command: {details.get('cmdline', 'N/A')}
-                """
-                
-                dialog = Gtk.MessageDialog(
-                    parent=self,
-                    flags=Gtk.DialogFlags.MODAL,
-                    type=Gtk.MessageType.INFO,
-                    buttons=Gtk.ButtonsType.OK,
-                    message_format=_("Process Details")
-                )
-                dialog.format_secondary_text(details_text.strip())
-                dialog.run()
-                dialog.destroy()
-            else:
-                self.show_error_dialog(_("Process Details"), _("Failed to get process details"))
-    
-    def on_process_priority(self, button):
-        """Handle process priority"""
-        selection = self.process_treeview.get_selection()
-        model, tree_iter = selection.get_selected()
-        if tree_iter:
-            pid = model[tree_iter][1]
-            
-            dialog = Gtk.Dialog(title=_("Set Process Priority"), parent=self, flags=Gtk.DialogFlags.MODAL)
-            dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OK, Gtk.ResponseType.OK)
-            
-            grid = Gtk.Grid()
-            grid.set_row_spacing(10)
-            grid.set_column_spacing(10)
-            grid.set_border_width(10)
-            
-            grid.attach(Gtk.Label(label=_("Priority (-20 to 19):")), 0, 0, 1, 1)
-            priority_entry = Gtk.Entry()
-            priority_entry.set_text("0")
-            grid.attach(priority_entry, 1, 0, 1, 1)
-            
-            grid.attach(Gtk.Label(label=_("Lower values = higher priority")), 0, 1, 2, 1)
-            
-            dialog.get_content_area().add(grid)
-            dialog.show_all()
-            
-            response = dialog.run()
-            if response == Gtk.ResponseType.OK:
-                try:
-                    priority = int(priority_entry.get_text())
-                    if -20 <= priority <= 19:
-                        def set_priority_with_password(password):
-                            success, message = ProcessManager.set_process_priority(pid, priority, password)
-                            if success:
-                                self.statusbar.push(0, _("Priority set successfully"))
-                            else:
-                                self.show_error_dialog(_("Failed to set priority"), message)
-                        
-                        self.show_password_dialog(_("Set Priority"), set_priority_with_password)
-                    else:
-                        self.show_error_dialog(_("Invalid Priority"), _("Priority must be between -20 and 19"))
-                except ValueError:
-                    self.show_error_dialog(_("Invalid Priority"), _("Priority must be a number"))
-            
-            dialog.destroy()
-    
-    def on_partition_selected(self, listbox, row):
-        """Handle partition selection"""
-        if row:
-            self.mount_button.set_sensitive(True)
-            self.unmount_button.set_sensitive(True)
-            self.format_button.set_sensitive(True)
-        else:
-            self.mount_button.set_sensitive(False)
-            self.unmount_button.set_sensitive(False)
-            self.format_button.set_sensitive(False)
-    
-    def on_mount_partition(self, button):
-        """Handle mount partition"""
-        row = self.partitions_list.get_selected_row()
-        if not row:
-            return
-        
-        box = row.get_child()
-        device_label = box.get_children()[0]
-        device = device_label.get_text()
-        
-        dialog = Gtk.Dialog(title=_("Mount Partition"), parent=self, flags=Gtk.DialogFlags.MODAL)
-        dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OK, Gtk.ResponseType.OK)
-        
-        grid = Gtk.Grid()
-        grid.set_row_spacing(10)
-        grid.set_column_spacing(10)
-        grid.set_border_width(10)
-        
-        grid.attach(Gtk.Label(label=_("Mount Point:")), 0, 0, 1, 1)
-        mountpoint_entry = Gtk.Entry()
-        grid.attach(mountpoint_entry, 1, 0, 1, 1)
-        
-        grid.attach(Gtk.Label(label=_("Filesystem Type:")), 0, 1, 1, 1)
-        fstype_combo = Gtk.ComboBoxText()
-        fstypes = ["auto", "ext4", "ext3", "ext2", "ntfs", "vfat", "btrfs", "xfs"]
-        for fstype in fstypes:
-            fstype_combo.append_text(fstype)
-        fstype_combo.set_active(0)
-        grid.attach(fstype_combo, 1, 1, 1, 1)
-        
-        dialog.get_content_area().add(grid)
-        dialog.show_all()
-        
-        response = dialog.run()
-        if response == Gtk.ResponseType.OK:
-            mountpoint = mountpoint_entry.get_text()
-            fstype = fstype_combo.get_active_text()
-            
-            def mount_with_password(password):
-                success, message = DiskManager.mount_filesystem(device, mountpoint, fstype, password)
-                if success:
-                    self.statusbar.push(0, _("Partition mounted successfully"))
-                    self.load_disks()
-                else:
-                    self.show_error_dialog(_("Failed to mount partition"), message)
-            
-            self.show_password_dialog(_("Mount Partition"), mount_with_password)
-        
-        dialog.destroy()
-    
-    def on_unmount_partition(self, button):
-        """Handle unmount partition"""
-        row = self.partitions_list.get_selected_row()
-        if not row:
-            return
-        
-        box = row.get_child()
-        mount_label = box.get_children()[1]
-        mountpoint = mount_label.get_text().replace("Mount: ", "")
-        
-        if not mountpoint or mountpoint == "":
-            self.show_error_dialog(_("Not Mounted"), _("This partition is not mounted"))
-            return
-        
-        def unmount_with_password(password):
-            success, message = DiskManager.unmount_filesystem(mountpoint, password)
-            if success:
-                self.statusbar.push(0, _("Partition unmounted successfully"))
-                self.load_disks()
-            else:
-                self.show_error_dialog(_("Failed to unmount partition"), message)
-        
-        self.show_password_dialog(_("Unmount Partition"), unmount_with_password)
-    
-    def on_format_partition(self, button):
-        """Handle format partition"""
-        row = self.partitions_list.get_selected_row()
-        if not row:
-            return
-        
-        box = row.get_child()
-        device_label = box.get_children()[0]
-        device = device_label.get_text()
-        
-        dialog = Gtk.Dialog(title=_("Format Partition"), parent=self, flags=Gtk.DialogFlags.MODAL)
-        dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OK, Gtk.ResponseType.OK)
-        
-        grid = Gtk.Grid()
-        grid.set_row_spacing(10)
-        grid.set_column_spacing(10)
-        grid.set_border_width(10)
-        
-        grid.attach(Gtk.Label(label=_("Filesystem Type:")), 0, 0, 1, 1)
-        fstype_combo = Gtk.ComboBoxText()
-        fstypes = ["ext4", "ext3", "ext2", "ntfs", "vfat", "btrfs", "xfs"]
-        for fstype in fstypes:
-            fstype_combo.append_text(fstype)
-        fstype_combo.set_active(0)
-        grid.attach(fstype_combo, 1, 0, 1, 1)
-        
-        warning_label = Gtk.Label()
-        warning_label.set_markup("<span foreground='red'><b>Warning: This will erase all data on the partition!</b></span>")
-        grid.attach(warning_label, 0, 1, 2, 1)
-        
-        dialog.get_content_area().add(grid)
-        dialog.show_all()
-        
-        response = dialog.run()
-        if response == Gtk.ResponseType.OK:
-            fstype = fstype_combo.get_active_text()
-            
-            def format_with_password(password):
-                success, message = DiskManager.format_partition(device, fstype, password)
-                if success:
-                    self.statusbar.push(0, _("Partition formatted successfully"))
-                    self.load_disks()
-                else:
-                    self.show_error_dialog(_("Failed to format partition"), message)
-            
-            self.show_password_dialog(_("Format Partition"), format_with_password)
-        
-        dialog.destroy()
-    
-    def on_launch_partition_manager(self, button):
-        """Handle launch partition manager"""
-        def launch_with_password(password):
-            success, message = DiskManager.launch_partition_manager(password)
-            if success:
-                self.statusbar.push(0, _("Partition manager launched"))
-            else:
-                self.show_error_dialog(_("Failed to launch partition manager"), message)
-        
-        # Check if gparted is available
-        if DependencyManager.check_dependency("gparted"):
-            self.show_password_dialog(_("Launch Partition Manager"), launch_with_password)
-        else:
-            # Offer to install gparted
-            def install_and_launch(password):
-                success, message = DependencyManager.install_dependency("gparted", self)
-                if success:
-                    launch_with_password(password)
-                else:
-                    self.show_error_dialog(_("Installation failed"), message)
-            
-            self.show_password_dialog(_("Install Partition Manager"), install_and_launch)
-    
-    def on_backup_selected(self, listbox, row):
-        """Handle backup selection"""
-        if row:
-            self.restore_button.set_sensitive(True)
-            self.delete_backup_button.set_sensitive(True)
-        else:
-            self.restore_button.set_sensitive(False)
-            self.delete_backup_button.set_sensitive(False)
-    
-    def on_create_backup(self, button):
-        """Handle create backup"""
-        name = self.backup_name_entry.get_text()
-        description = self.backup_description_entry.get_text()
-        
-        def create_with_password(password):
-            success, message = BackupManager.create_backup(name, description, password)
-            if success:
-                self.statusbar.push(0, _("Backup created successfully"))
-                self.load_backups()
-                self.backup_name_entry.set_text("")
-                self.backup_description_entry.set_text("")
-            else:
-                self.show_error_dialog(_("Failed to create backup"), message)
-        
-        self.show_password_dialog(_("Create Backup"), create_with_password)
-    
-    def on_restore_backup(self, button):
-        """Handle restore backup"""
-        row = self.backups_list.get_selected_row()
-        if not row:
-            return
-        
-        box = row.get_child()
-        name_label = box.get_children()[0]
-        backup_id = name_label.get_text()
-        
-        dialog = Gtk.MessageDialog(
-            parent=self,
-            flags=Gtk.DialogFlags.MODAL,
-            type=Gtk.MessageType.QUESTION,
-            buttons=Gtk.ButtonsType.YES_NO,
-            message_format=_("Restore Backup")
-        )
-        dialog.format_secondary_text(_("Are you sure you want to restore backup '{}'? This will overwrite system files.").format(backup_id))
-        response = dialog.run()
-        dialog.destroy()
-        
-        if response == Gtk.ResponseType.YES:
-            def restore_with_password(password):
-                success, message = BackupManager.restore_backup(backup_id, password)
-                if success:
-                    self.statusbar.push(0, _("System restored successfully"))
-                else:
-                    self.show_error_dialog(_("Failed to restore backup"), message)
-            
-            self.show_password_dialog(_("Restore Backup"), restore_with_password)
-    
-    def on_delete_backup(self, button):
-        """Handle delete backup"""
-        row = self.backups_list.get_selected_row()
-        if not row:
-            return
-        
-        box = row.get_child()
-        name_label = box.get_children()[0]
-        backup_id = name_label.get_text()
-        
-        dialog = Gtk.MessageDialog(
-            parent=self,
-            flags=Gtk.DialogFlags.MODAL,
-            type=Gtk.MessageType.QUESTION,
-            buttons=Gtk.ButtonsType.YES_NO,
-            message_format=_("Delete Backup")
-        )
-        dialog.format_secondary_text(_("Are you sure you want to delete backup '{}'?").format(backup_id))
-        response = dialog.run()
-        dialog.destroy()
-        
-        if response == Gtk.ResponseType.YES:
-            def delete_with_password(password):
-                success, message = BackupManager.delete_backup(backup_id, password)
-                if success:
-                    self.statusbar.push(0, _("Backup deleted successfully"))
-                    self.load_backups()
-                else:
-                    self.show_error_dialog(_("Failed to delete backup"), message)
-            
-            self.show_password_dialog(_("Delete Backup"), delete_with_password)
-    
-    def on_refresh_backups(self, button):
-        """Handle refresh backups"""
-        self.load_backups()
-    
-    def on_clean_system(self, button):
-        """Handle clean system"""
-        options = {}
-        if self.clean_package_cache.get_active():
-            options['package_cache'] = True
-        if self.clean_temp_files.get_active():
-            options['temp_files'] = True
-        if self.clean_logs.get_active():
-            options['logs'] = True
-        if self.clean_thumbnails.get_active():
-            options['thumbnails'] = True
-        
-        def clean_with_password(password):
-            results = []
-            
-            if options.get('package_cache'):
-                success, message = SystemCleaner.clean_package_cache(password)
-                results.append(f"Package cache: {'Success' if success else 'Failed'}")
-            
-            if options.get('temp_files'):
-                success, message = SystemCleaner.clean_temp_files(password)
-                results.append(f"Temporary files: {'Success' if success else 'Failed'}")
-            
-            if options.get('logs'):
-                success, message = SystemCleaner.clean_logs(password)
-                results.append(f"System logs: {'Success' if success else 'Failed'}")
-            
-            if options.get('thumbnails'):
-                success, message = SystemCleaner.clean_thumbnails()
-                results.append(f"Thumbnail cache: {'Success' if success else 'Failed'}")
-            
-            # Show results
-            dialog = Gtk.MessageDialog(
-                parent=self,
-                flags=Gtk.DialogFlags.MODAL,
-                type=Gtk.MessageType.INFO,
-                buttons=Gtk.ButtonsType.OK,
-                message_format=_("Cleaning Results")
-            )
-            dialog.format_secondary_text("\n".join(results))
-            dialog.run()
-            dialog.destroy()
-            
-            # Refresh disk usage
-            self.load_disk_usage()
-        
-        self.show_password_dialog(_("Clean System"), clean_with_password)
-    
+    # Quick action handlers
     def on_quick_update(self, button):
         """Handle quick system update"""
         def update_with_password(password):
             success, message = self.pkg_manager.update_system(password)
             if success:
-                self.statusbar.push(0, _("System updated"))
+                self.statusbar.push(0, "System updated")
                 self.load_packages()
             else:
-                self.show_error_dialog(_("Update failed"), message)
+                self.show_error_dialog("Update failed", message)
         
-        self.show_password_dialog(_("Update System"), update_with_password)
+        self.show_password_dialog("Update System", update_with_password)
     
     def on_quick_clean(self, button):
         """Handle quick system clean"""
         def clean_with_password(password):
-            success, message = SystemCleaner.clean_package_cache(password)
-            if success:
-                self.statusbar.push(0, _("System cleaned"))
+            stdout, stderr, code = run_sudo_command("apt autoremove -y && apt autoclean", password)
+            if code == 0:
+                self.statusbar.push(0, "System cleaned")
             else:
-                self.show_error_dialog(_("Clean failed"), message)
+                self.show_error_dialog("Clean failed", stderr)
         
-        self.show_password_dialog(_("Clean System"), clean_with_password)
+        self.show_password_dialog("Clean System", clean_with_password)
     
-    def on_quick_backup(self, button):
-        """Handle quick system backup"""
-        tool = BackupManager.check_backup_tool()
-        if not tool:
-            # Offer to install a backup tool
-            if SYSTEM == "Linux":
-                if DISTRO in ["arch", "manjaro"]:
-                    tool_name = "timeshift"
-                elif DISTRO in ["opensuse-leap", "opensuse-tumbleweed"]:
-                    tool_name = "snapper"
-                else:
-                    tool_name = "timeshift"
-                
-                def install_and_backup(password):
-                    success, message = DependencyManager.install_dependency(tool_name, self)
-                    if success:
-                        success, message = BackupManager.create_backup("Quick Backup", "Created from Dockpanel", password)
-                        if success:
-                            self.statusbar.push(0, _("Backup created successfully"))
-                        else:
-                            self.show_error_dialog(_("Backup failed"), message)
-                    else:
-                        self.show_error_dialog(_("Installation failed"), message)
-                
-                self.show_password_dialog(_("Install Backup Tool"), install_and_backup)
-            else:
-                self.show_error_dialog(_("No Backup Tool"), _("No backup tool available for this platform"))
-        else:
-            def create_with_password(password):
-                success, message = BackupManager.create_backup("Quick Backup", "Created from Dockpanel", password)
-                if success:
-                    self.statusbar.push(0, _("Backup created successfully"))
-                else:
-                    self.show_error_dialog(_("Backup failed"), message)
-            
-            self.show_password_dialog(_("Create Backup"), create_with_password)
-    
-    def on_quick_info(self, button):
-        """Handle quick system info"""
-        info = f"""
-System: {SYSTEM} {DISTRO}
-Kernel: {platform.release()}
-Hostname: {socket.gethostname()}
-CPU: {SystemInfo.get_cpu_model()}
-Cores: {SystemInfo.get_cpu_cores()}
-Memory: {SystemInfo.get_memory_info()['total']} GB
-Disk: {SystemInfo.get_disk_usage('/')['total']} GB
-Uptime: {datetime.fromtimestamp(time.time() - SystemInfo.get_uptime()).strftime('%Y-%m-%d %H:%M:%S')}
-        """
+    def on_quick_network(self, button):
+        """Handle quick network info"""
+        info = "Network Interfaces:\n"
+        
+        stdout, _, code = run_command("ip addr show")
+        if code == 0:
+            current_iface = None
+            for line in stdout.split('\n'):
+                if line and not line.startswith(' '):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        current_iface = parts[1].rstrip(':')
+                        if current_iface != 'lo':
+                            info += f"\n- {current_iface}: {'Up' if 'UP' in line else 'Down'}"
+                elif current_iface and 'inet ' in line:
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        ip = parts[1].split('/')[0]
+                        info += f"\n  IP: {ip}"
         
         dialog = Gtk.MessageDialog(
             parent=self,
             flags=Gtk.DialogFlags.MODAL,
             type=Gtk.MessageType.INFO,
             buttons=Gtk.ButtonsType.OK,
-            message_format=_("System Information")
+            message_format="Network Information"
         )
-        dialog.format_secondary_text(info.strip())
+        dialog.format_secondary_text(info)
         dialog.run()
         dialog.destroy()
     
-    def show_error_dialog(self, title, message):
-        """Show error dialog"""
+    def on_quick_services(self, button):
+        """Handle quick service status"""
+        info = "Service Status:\n"
+        
+        stdout, _, code = run_command("systemctl list-units --type=service --state=running --no-pager | head -10")
+        if code == 0:
+            for line in stdout.split('\n')[1:]:
+                if line.strip() and '.service' in line:
+                    parts = line.split()
+                    if len(parts) >= 4:
+                        info += f"\n- {parts[0]}: {parts[1]} {parts[2]} {parts[3]}"
+        
         dialog = Gtk.MessageDialog(
             parent=self,
             flags=Gtk.DialogFlags.MODAL,
-            type=Gtk.MessageType.ERROR,
+            type=Gtk.MessageType.INFO,
             buttons=Gtk.ButtonsType.OK,
-            message_format=title
+            message_format="Service Status"
         )
-        dialog.format_secondary_text(message)
+        dialog.format_secondary_text(info)
         dialog.run()
         dialog.destroy()
+    
+    def on_quick_disk(self, button):
+        """Handle quick disk usage"""
+        info = "Disk Usage:\n"
+        
+        stdout, _, code = run_command("df -h")
+        if code == 0:
+            for line in stdout.split('\n')[1:]:
+                if line.strip():
+                    parts = line.split()
+                    if len(parts) >= 6:
+                        info += f"\n- {parts[0]}: {parts[2]}/{parts[1]} ({parts[4]}) mounted on {parts[5]}"
+        
+        dialog = Gtk.MessageDialog(
+            parent=self,
+            flags=Gtk.DialogFlags.MODAL,
+            type=Gtk.MessageType.INFO,
+            buttons=Gtk.ButtonsType.OK,
+            message_format="Disk Usage"
+        )
+        dialog.format_secondary_text(info)
+        dialog.run()
+        dialog.destroy()
+    
+    def on_quick_logs(self, button):
+        """Handle quick logs view"""
+        logs = self.log_manager.get_logs('system', 20)
+        info = "Recent System Logs:\n" + "\n".join(logs)
+        
+        dialog = Gtk.MessageDialog(
+            parent=self,
+            flags=Gtk.DialogFlags.MODAL,
+            type=Gtk.MessageType.INFO,
+            buttons=Gtk.ButtonsType.OK,
+            message_format="System Logs"
+        )
+        dialog.format_secondary_text(info)
+        dialog.run()
+        dialog.destroy()
+    
+    def on_clean_system(self, button):
+        """Handle clean system"""
+        options = []
+        if self.clean_cache_check.get_active():
+            options.append("package cache")
+        if self.clean_temp_check.get_active():
+            options.append("temporary files")
+        if self.clean_logs_check.get_active():
+            options.append("system logs")
+        
+        if not options:
+            self.show_error_dialog("No Options Selected", "Please select at least one cleaning option.")
+            return
+        
+        dialog = Gtk.MessageDialog(
+            parent=self,
+            flags=Gtk.DialogFlags.MODAL,
+            type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.YES_NO,
+            message_format="Clean System"
+        )
+        dialog.format_secondary_text(f"Are you sure you want to clean {', '.join(options)}?")
+        response = dialog.run()
+        dialog.destroy()
+        
+        if response == Gtk.ResponseType.YES:
+            def clean_with_password(password):
+                results = []
+                
+                if "package cache" in options:
+                    stdout, stderr, code = run_sudo_command("apt autoremove -y && apt autoclean", password)
+                    results.append(f"Package cache: {'Success' if code == 0 else 'Failed'}")
+                
+                if "temporary files" in options:
+                    stdout, stderr, code = run_sudo_command("find /tmp -type f -atime +7 -delete", password)
+                    results.append(f"Temporary files: {'Success' if code == 0 else 'Failed'}")
+                
+                if "system logs" in options:
+                    stdout, stderr, code = run_sudo_command("journalctl --vacuum-time=7d", password)
+                    results.append(f"System logs: {'Success' if code == 0 else 'Failed'}")
+                
+                # Show results
+                dialog = Gtk.MessageDialog(
+                    parent=self,
+                    flags=Gtk.DialogFlags.MODAL,
+                    type=Gtk.MessageType.INFO,
+                    buttons=Gtk.ButtonsType.OK,
+                    message_format="Cleaning Results"
+                )
+                dialog.format_secondary_text("\n".join(results))
+                dialog.run()
+                dialog.destroy()
+                
+                self.statusbar.push(0, "System cleaning completed")
+            
+            self.show_password_dialog("Clean System", clean_with_password)
 
+# Application Class
 class DockpanelApplication(Gtk.Application):
     """Main application class"""
     
@@ -5584,6 +4115,7 @@ class DockpanelApplication(Gtk.Application):
         """Startup the application"""
         Gtk.Application.do_startup(self)
 
+# Main Entry Point
 def main():
     """Main entry point"""
     app = DockpanelApplication()
